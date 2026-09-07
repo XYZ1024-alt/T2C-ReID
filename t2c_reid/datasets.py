@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
+import random
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-import random
 
-from PIL import Image
 import torch
+from PIL import Image
 
-from t2c_reid.native import native_extension as _native
 from t2c_reid.data import ReIDSample
+from t2c_reid.native import native_extension as _native
 from t2c_reid.transforms import ImageTransformConfig
 
 ImageTransform = Callable[[Image.Image], torch.Tensor]
@@ -63,7 +63,7 @@ class ReIDImageBatch:
     original_person_ids: tuple[int, ...]
     original_camera_ids: tuple[int, ...]
 
-    def pin_memory(self) -> "ReIDImageBatch":
+    def pin_memory(self) -> ReIDImageBatch:
         return ReIDImageBatch(
             images=self.images.pin_memory(),
             person_ids=self.person_ids.pin_memory(),
@@ -96,7 +96,9 @@ class ReIDImageDataset(torch.utils.data.Dataset):
         return ReIDImageItem(
             image=self._load_image(sample),
             person_id=self._mapped_person_id(sample),
-            camera_id=_map_value(self._config.camera_id_map, sample.camera_id, "camera_id"),
+            camera_id=_map_value(
+                self._config.camera_id_map, sample.camera_id, "camera_id"
+            ),
             original_person_id=sample.person_id,
             original_camera_id=sample.camera_id,
         )
@@ -136,7 +138,9 @@ class ReIDMetadataDataset(torch.utils.data.Dataset):
         return ReIDImageRecord(
             image_path=str(sample.image_path),
             person_id=self._mapped_person_id(sample),
-            camera_id=_map_value(self._config.camera_id_map, sample.camera_id, "camera_id"),
+            camera_id=_map_value(
+                self._config.camera_id_map, sample.camera_id, "camera_id"
+            ),
             original_person_id=sample.person_id,
             original_camera_id=sample.camera_id,
         )
@@ -159,7 +163,11 @@ class RustReIDBatchCollator:
             raise ValueError("cannot collate an empty ReID batch")
         config = self.transform
         batch_seed = (
-            int(torch.randint(0, torch.iinfo(torch.int64).max, (), dtype=torch.int64).item())
+            int(
+                torch.randint(
+                    0, torch.iinfo(torch.int64).max, (), dtype=torch.int64
+                ).item()
+            )
             if config.training
             else 0
         )
@@ -183,8 +191,12 @@ class RustReIDBatchCollator:
         )
         return ReIDImageBatch(
             images=images,
-            person_ids=torch.tensor([item.person_id for item in items], dtype=torch.long),
-            camera_ids=torch.tensor([item.camera_id for item in items], dtype=torch.long),
+            person_ids=torch.tensor(
+                [item.person_id for item in items], dtype=torch.long
+            ),
+            camera_ids=torch.tensor(
+                [item.camera_id for item in items], dtype=torch.long
+            ),
             original_person_ids=tuple(item.original_person_id for item in items),
             original_camera_ids=tuple(item.original_camera_id for item in items),
         )
@@ -200,9 +212,13 @@ class IdentityBalancedBatchSampler(torch.utils.data.Sampler[list[int]]):
         self._labels = tuple(labels)
         self._batch_size = batch_size
         self._instances_per_identity = instances_per_identity
-        self._identities_per_batch = _identities_per_batch(batch_size, instances_per_identity)
+        self._identities_per_batch = _identities_per_batch(
+            batch_size, instances_per_identity
+        )
         self._groups = _eligible_identity_groups(self._labels, instances_per_identity)
-        _validate_identity_groups(self._groups, self._identities_per_batch, instances_per_identity)
+        _validate_identity_groups(
+            self._groups, self._identities_per_batch, instances_per_identity
+        )
 
     def __iter__(self):
         for _ in range(len(self)):
@@ -216,7 +232,9 @@ class IdentityBalancedBatchSampler(torch.utils.data.Sampler[list[int]]):
         return [
             index
             for label in labels
-            for index in random.sample(self._groups[label], self._instances_per_identity)
+            for index in random.sample(
+                self._groups[label], self._instances_per_identity
+            )
         ]
 
 
@@ -240,23 +258,39 @@ def collate_reid_batches(items: Sequence[ReIDImageItem]) -> ReIDImageBatch:
 
 def require_data_backend(backend: str) -> str:
     if backend not in SUPPORTED_DATA_BACKENDS:
-        raise ValueError(f"unsupported data backend {backend!r}; expected one of {SUPPORTED_DATA_BACKENDS}")
+        raise ValueError(
+            f"unsupported data backend {backend!r}; expected one of {SUPPORTED_DATA_BACKENDS}"
+        )
     return backend
 
 
 def _identities_per_batch(batch_size: int, instances_per_identity: int) -> int:
     if batch_size < MIN_IDENTITIES_PER_BATCH * instances_per_identity:
-        raise ValueError("batch_size must allow at least two identities with positive pairs")
+        raise ValueError(
+            "batch_size must allow at least two identities with positive pairs"
+        )
     if batch_size % instances_per_identity != 0:
         raise ValueError("batch_size must be divisible by instances_per_identity")
     return batch_size // instances_per_identity
 
 
-def _eligible_identity_groups(labels: Sequence[int], instances_per_identity: int) -> dict[int, list[int]]:
+def _eligible_identity_groups(
+    labels: Sequence[int], instances_per_identity: int
+) -> dict[int, list[int]]:
     groups: dict[int, list[int]] = {}
     for index, label in enumerate(labels):
         groups.setdefault(label, []).append(index)
-    return {label: indices for label, indices in groups.items() if len(indices) >= instances_per_identity}
+    insufficient = {
+        label: len(indices)
+        for label, indices in groups.items()
+        if len(indices) < instances_per_identity
+    }
+    if insufficient:
+        raise ValueError(
+            f"every training identity requires at least {instances_per_identity} images; "
+            f"insufficient identity counts: {insufficient}"
+        )
+    return groups
 
 
 def _validate_identity_groups(

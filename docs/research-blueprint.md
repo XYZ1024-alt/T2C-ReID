@@ -10,8 +10,8 @@ Train2Central ReID（T2C-ReID）面向监控场景下的 Image-to-Image 行人�
 
 ```text
 f_v_raw = SigLIP2_ImageEncoder(image)
-f_v = FeatureHead(f_v_raw)
-f_t = SigLIP2_TextEncoder(prompt)
+f_v = normalize(FeatureHead(f_v_raw))
+f_t = normalize(SigLIP2_TextEncoder(prompt))
 f   = normalize(f_v + beta * f_t)
 ```
 
@@ -35,7 +35,7 @@ T2C-ReID 不引入以下组件或评测设定：
 图像流使用 `google/siglip2-so400m-patch14-384` image encoder。给定行人图像 `x`，图像编码器输出归一化视觉特征：
 
 ```text
-f_v = normalize(E_v(x))
+f_v = normalize(FeatureHead(E_v(x)))
 ```
 
 `f_v` 是主检索信号，也必须能独立构成 image-only baseline。
@@ -96,7 +96,7 @@ Stage-2 训练检索模型，包括图像监督、prompt 文本特征、融合�
 
 ```text
 f_v_raw = E_v(x_i)
-f_v = FeatureHead(f_v_raw)
+f_v = normalize(FeatureHead(f_v_raw))
 f_t = normalize(E_t(P_global + P_cam(c_i) [+ P_id(y_i) for training alignment]))
 f   = normalize(f_v + beta * f_t)
 ```

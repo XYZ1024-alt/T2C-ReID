@@ -20,10 +20,14 @@ google/siglip2-so400m-patch14-384
 
 ```text
 f_v_raw = SigLIP2_ImageEncoder(image)
-f_v     = FeatureHead(f_v_raw)              # Identity or BNNeck
+f_v     = normalize(FeatureHead(f_v_raw))   # Identity or BNNeck, then L2
 f_t     = normalize(SigLIP2_TextEncoder(prompt))
 f       = normalize(f_v + beta * f_t)
 ```
+
+融合前图像与文本均做 L2 归一化，`beta` 不随特征范数变化。Triplet 的距离计算与
+困难样本选择必须禁用 autocast 并使用 FP32。PK 采样初始化时检查每个训练身份
+至少有 `num_instances` 张图片，不足时明确报错，不允许静默丢弃身份。
 
 推理只允许身份无关 prompt：
 
@@ -47,7 +51,7 @@ path + person/camera metadata
   -> fixed SigLIP 2 vision_model + positional interpolation
   -> f_v_raw
   -> feature head (Identity or BNNeck)
-  -> f_v
+  -> normalize -> f_v
 
 PromptBank
   -> checkpoint-native fixed-length token sequence
@@ -58,8 +62,8 @@ f_v + beta * f_t
   -> normalize
   -> retrieval
 
-f_v_raw / f_v
-  -> alignment / triplet / ID losses
+f_v_raw -> alignment / triplet losses
+FeatureHead(f_v_raw) -> ID loss
 ```
 
 主要实现文件：

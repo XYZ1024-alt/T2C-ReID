@@ -166,7 +166,7 @@ Retrieval flow:
 
 ```text
 f_v_raw = SigLIP2_ImageEncoder(image)
-f_v     = FeatureHead(f_v_raw)              # Identity or BNNeck
+f_v     = normalize(FeatureHead(f_v_raw))   # Identity or BNNeck, then L2
 f_t     = normalize(SigLIP2_TextEncoder(global + camera prompt))
 f       = normalize(f_v + beta * f_t)
 ```

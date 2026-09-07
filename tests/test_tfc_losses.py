@@ -30,7 +30,9 @@ class TFCLossTest(unittest.TestCase):
         self.assertTrue(bank.visual_local_initialized[0, 1])
         self.assertFalse(bank.visual_local_initialized[1, 0])
         self.assertTrue(torch.allclose(bank.visual_local_centers[0, 0], visual[0]))
-        self.assertTrue(torch.allclose(bank.text_local_centers[0, 1], text[1] / text[1].norm()))
+        self.assertTrue(
+            torch.allclose(bank.text_local_centers[0, 1], text[1] / text[1].norm())
+        )
 
     def test_tail_identity_uses_more_conservative_momentum(self):
         bank = _tfc_bank()
@@ -70,8 +72,10 @@ class TFCLossTest(unittest.TestCase):
             torch.tensor([1]),
         )
 
-        expected = torch.tensor([2 ** -0.5, 2 ** -0.5])
-        self.assertTrue(torch.allclose(bank.visual_global_centers[0], expected, atol=1e-6))
+        expected = torch.tensor([2**-0.5, 2**-0.5])
+        self.assertTrue(
+            torch.allclose(bank.visual_global_centers[0], expected, atol=1e-6)
+        )
 
     def test_effective_number_weights_upweight_tail_identity(self):
         bank = _tfc_bank()
@@ -244,17 +248,29 @@ class TFCLossTest(unittest.TestCase):
 
         restored.load_state_dict(bank.state_dict())
 
-        self.assertTrue(torch.equal(restored.visual_local_centers, bank.visual_local_centers))
-        self.assertTrue(torch.equal(restored.text_local_centers, bank.text_local_centers))
-        self.assertTrue(torch.equal(restored.visual_global_centers, bank.visual_global_centers))
-        self.assertTrue(torch.equal(restored.text_global_centers, bank.text_global_centers))
         self.assertTrue(
-            torch.equal(restored.visual_local_initialized, bank.visual_local_initialized)
+            torch.equal(restored.visual_local_centers, bank.visual_local_centers)
+        )
+        self.assertTrue(
+            torch.equal(restored.text_local_centers, bank.text_local_centers)
+        )
+        self.assertTrue(
+            torch.equal(restored.visual_global_centers, bank.visual_global_centers)
+        )
+        self.assertTrue(
+            torch.equal(restored.text_global_centers, bank.text_global_centers)
+        )
+        self.assertTrue(
+            torch.equal(
+                restored.visual_local_initialized, bank.visual_local_initialized
+            )
         )
         self.assertTrue(
             torch.equal(restored.text_global_initialized, bank.text_global_initialized)
         )
-        self.assertTrue(torch.equal(restored.camera_transfer_logits, bank.camera_transfer_logits))
+        self.assertTrue(
+            torch.equal(restored.camera_transfer_logits, bank.camera_transfer_logits)
+        )
 
     def test_tfc_validates_statistics_and_indices(self):
         with self.assertRaises(ValueError):
@@ -370,9 +386,7 @@ class SiglipAlignmentLossTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             supervised_siglip_loss(torch.eye(2), torch.eye(2), torch.tensor([0]))
         with self.assertRaises(ValueError):
-            supervised_siglip_loss(
-                torch.eye(2), torch.eye(2), torch.tensor([0.5, 1.5])
-            )
+            supervised_siglip_loss(torch.eye(2), torch.eye(2), torch.tensor([0.5, 1.5]))
 
 
 class SiglipIdentityAnchorLossTest(unittest.TestCase):
@@ -408,12 +422,8 @@ class SiglipIdentityAnchorLossTest(unittest.TestCase):
         two = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
         three = torch.tensor([[1.0, 0.0], [0.0, 1.0], [0.9, 0.1]])
 
-        without_extra = siglip_identity_anchor_loss(
-            visual, two, ids, logit_scale=5.0
-        )
-        with_extra = siglip_identity_anchor_loss(
-            visual, three, ids, logit_scale=5.0
-        )
+        without_extra = siglip_identity_anchor_loss(visual, two, ids, logit_scale=5.0)
+        with_extra = siglip_identity_anchor_loss(visual, three, ids, logit_scale=5.0)
 
         self.assertGreater(float(with_extra), float(without_extra))
 
@@ -423,7 +433,9 @@ class SiglipIdentityAnchorLossTest(unittest.TestCase):
                 torch.ones(2, 2, 2), torch.eye(2), torch.tensor([0, 1])
             )
         with self.assertRaises(ValueError):
-            siglip_identity_anchor_loss(torch.eye(2), torch.ones(2), torch.tensor([0, 1]))
+            siglip_identity_anchor_loss(
+                torch.eye(2), torch.ones(2), torch.tensor([0, 1])
+            )
         with self.assertRaises(ValueError):
             siglip_identity_anchor_loss(
                 torch.ones(2, 3), torch.ones(4, 2), torch.tensor([0, 1])
@@ -435,10 +447,58 @@ class SiglipIdentityAnchorLossTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             siglip_identity_anchor_loss(torch.eye(2), torch.eye(2), torch.tensor([0]))
         with self.assertRaises(ValueError):
-            siglip_identity_anchor_loss(torch.eye(2), torch.eye(2), torch.tensor([0, 2]))
+            siglip_identity_anchor_loss(
+                torch.eye(2), torch.eye(2), torch.tensor([0, 2])
+            )
 
 
 class TripletLossTest(unittest.TestCase):
+    def test_autocast_preserves_loss_and_gradients(self):
+        devices = ["cpu"]
+        if torch.cuda.is_available():
+            devices.append("cuda")
+        generator = torch.Generator().manual_seed(7)
+        base = torch.randn(1, 1152, generator=generator)
+        features = base + 0.02 * torch.randn(8, 1152, generator=generator)
+        for device in devices:
+            dtypes = [torch.bfloat16] if device == "cpu" else [torch.float16]
+            if device == "cuda" and torch.cuda.is_bf16_supported():
+                dtypes.append(torch.bfloat16)
+            labels = torch.arange(4, device=device).repeat_interleave(2)
+            for dtype in dtypes:
+                for metric in ("euclidean", "cosine"):
+                    for input_dtype in (torch.float32, dtype):
+                        with self.subTest(
+                            device=device,
+                            dtype=dtype,
+                            metric=metric,
+                            input_dtype=input_dtype,
+                        ):
+                            actual_input = (
+                                features.to(device=device, dtype=input_dtype)
+                                .detach()
+                                .clone()
+                                .requires_grad_()
+                            )
+                            reference_input = (
+                                actual_input.detach().float().requires_grad_()
+                            )
+                            reference = batch_hard_triplet_loss(
+                                reference_input, labels, metric=metric
+                            )
+                            reference.backward()
+                            with torch.autocast(device_type=device, dtype=dtype):
+                                actual = batch_hard_triplet_loss(
+                                    actual_input, labels, metric=metric
+                                )
+                            actual.backward()
+                            self.assertEqual(actual.dtype, torch.float32)
+                            torch.testing.assert_close(actual, reference)
+                            self.assertGreater(reference_input.grad.norm().item(), 0.0)
+                            torch.testing.assert_close(
+                                actual_input.grad, reference_input.grad.to(input_dtype)
+                            )
+
     def test_batch_hard_triplet_penalizes_close_negative(self):
         features = torch.tensor([[1.0, 0.0], [0.9, 0.1], [0.8, 0.2]])
         labels = torch.tensor([0, 0, 1])
@@ -494,7 +554,9 @@ class TripletLossTest(unittest.TestCase):
                 labels = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3])
 
                 actual_input = features.clone().requires_grad_(True)
-                actual = batch_hard_triplet_loss(actual_input, labels, 0.3, metric=metric)
+                actual = batch_hard_triplet_loss(
+                    actual_input, labels, 0.3, metric=metric
+                )
                 actual.backward()
 
                 reference_input = features.clone().requires_grad_(True)
@@ -516,7 +578,14 @@ class CrossCameraLossVectorizationTest(unittest.TestCase):
         torch.manual_seed(3)
         counts = torch.tensor([6, 5, 4, 3, 2, 2])
         per_camera = torch.tensor(
-            [[2, 2, 1, 1], [2, 1, 1, 1], [1, 1, 1, 1], [1, 1, 1, 0], [1, 1, 0, 0], [2, 0, 0, 0]]
+            [
+                [2, 2, 1, 1],
+                [2, 1, 1, 1],
+                [1, 1, 1, 1],
+                [1, 1, 1, 0],
+                [1, 1, 0, 0],
+                [2, 0, 0, 0],
+            ]
         )
         for trial in range(3):
             with self.subTest(trial=trial):
@@ -527,7 +596,10 @@ class CrossCameraLossVectorizationTest(unittest.TestCase):
                 for _ in range(4):
                     person_ids = torch.randint(0, 6, (10,))
                     camera_ids = torch.stack(
-                        [torch.multinomial(per_camera[p].float(), 1)[0] for p in person_ids]
+                        [
+                            torch.multinomial(per_camera[p].float(), 1)[0]
+                            for p in person_ids
+                        ]
                     )
                     bank.update(
                         F.normalize(torch.randn(10, 8), dim=1),
@@ -565,7 +637,9 @@ class CrossCameraLossVectorizationTest(unittest.TestCase):
                     torch.allclose(actual_input.grad, reference_input.grad, atol=1e-6)
                 )
                 self.assertTrue(
-                    torch.allclose(actual_transfer_grad, reference_transfer_grad, atol=1e-6)
+                    torch.allclose(
+                        actual_transfer_grad, reference_transfer_grad, atol=1e-6
+                    )
                 )
 
     def test_single_camera_identity_contributes_nothing(self):

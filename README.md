@@ -27,10 +27,16 @@ The image and text towers produce features in the same SigLIP 2 output space:
 
 ```text
 f_v_raw = SigLIP2_ImageEncoder(image)
-f_v     = FeatureHead(f_v_raw)              # Identity or BNNeck
+f_v     = normalize(FeatureHead(f_v_raw))   # Identity or BNNeck, then L2
 f_t     = normalize(SigLIP2_TextEncoder(prompt))
 f       = normalize(f_v + beta * f_t)
 ```
+
+Both fusion inputs are L2-normalized, so `beta` controls their relative
+directional contribution independently of feature norms. Triplet distance
+computation and hard mining run in FP32 even with BF16/FP16 autocast.
+PK sampling requires every training identity to have at least `num_instances`
+images; insufficient identities raise an error instead of being silently dropped.
 
 Training identity prompts are never used for query/gallery retrieval:
 

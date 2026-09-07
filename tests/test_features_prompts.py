@@ -15,7 +15,7 @@ class FeaturePromptTest(unittest.TestCase):
         visual = torch.tensor([[1.0, 0.0]])
         text = torch.tensor([[0.0, 1.0]])
         fused = fuse_features(visual, text, beta=1.0)
-        expected = torch.tensor([[2 ** -0.5, 2 ** -0.5]])
+        expected = torch.tensor([[2**-0.5, 2**-0.5]])
         self.assertTrue(torch.allclose(fused, expected))
 
     def test_fuse_features_beta_zero_returns_l2_normalized_visual_bitwise(self):
@@ -29,8 +29,18 @@ class FeaturePromptTest(unittest.TestCase):
 
         self.assertTrue(torch.equal(fused, l2_normalize(visual)))
 
+    def test_fusion_beta_is_independent_of_input_norms(self):
+        visual = torch.tensor([[100.0, 0.0]])
+        text = torch.tensor([[0.0, 7.0]])
+        expected = l2_normalize(torch.tensor([[1.0, 0.1]]))
+        torch.testing.assert_close(fuse_features(visual, text, beta=0.1), expected)
+
     def test_prompt_bank_training_adds_identity_prompt(self):
-        bank = PromptBank(PromptConfig(num_cameras=2, num_train_ids=3, context_length=2, embedding_dim=2))
+        bank = PromptBank(
+            PromptConfig(
+                num_cameras=2, num_train_ids=3, context_length=2, embedding_dim=2
+            )
+        )
         with torch.no_grad():
             bank.global_prompt.fill_(1.0)
             bank.camera_prompts.zero_()
@@ -43,7 +53,11 @@ class FeaturePromptTest(unittest.TestCase):
         self.assertTrue(torch.equal(prompt, torch.full((1, 2, 2), 7.0)))
 
     def test_prompt_bank_inference_excludes_identity_prompt(self):
-        bank = PromptBank(PromptConfig(num_cameras=2, num_train_ids=3, context_length=1, embedding_dim=2))
+        bank = PromptBank(
+            PromptConfig(
+                num_cameras=2, num_train_ids=3, context_length=1, embedding_dim=2
+            )
+        )
         with torch.no_grad():
             bank.global_prompt.fill_(1.0)
             bank.camera_prompts[1].fill_(2.0)
@@ -56,7 +70,11 @@ class FeaturePromptTest(unittest.TestCase):
     def test_prompt_bank_identity_anchor_excludes_camera_prompt(self):
         # The alignment anchor is a camera-agnostic identity prototype: global +
         # identity only, never the camera component.
-        bank = PromptBank(PromptConfig(num_cameras=2, num_train_ids=3, context_length=2, embedding_dim=2))
+        bank = PromptBank(
+            PromptConfig(
+                num_cameras=2, num_train_ids=3, context_length=2, embedding_dim=2
+            )
+        )
         with torch.no_grad():
             bank.global_prompt.fill_(1.0)
             bank.camera_prompts.fill_(2.0)
@@ -68,7 +86,11 @@ class FeaturePromptTest(unittest.TestCase):
         self.assertTrue(torch.equal(prompt, torch.full((1, 2, 2), 5.0)))
 
     def test_prompt_bank_identity_anchor_validates_person_ids(self):
-        bank = PromptBank(PromptConfig(num_cameras=2, num_train_ids=3, context_length=1, embedding_dim=2))
+        bank = PromptBank(
+            PromptConfig(
+                num_cameras=2, num_train_ids=3, context_length=1, embedding_dim=2
+            )
+        )
 
         with self.assertRaises(ValueError):
             bank.identity_anchor_prompts(torch.tensor([0.5]))

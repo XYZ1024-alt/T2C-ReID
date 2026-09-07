@@ -54,7 +54,9 @@ def siglip_identity_anchor_loss(
     if text_anchors.ndim != 2:
         raise ValueError("text_anchors must be a rank-2 tensor")
     if image_features.shape[1] != text_anchors.shape[1]:
-        raise ValueError("image_features and text_anchors must share the feature dimension")
+        raise ValueError(
+            "image_features and text_anchors must share the feature dimension"
+        )
     _validate_person_ids(person_ids, image_features.shape[0])
     num_anchors = text_anchors.shape[0]
     if torch.any(person_ids < 0) or torch.any(person_ids >= num_anchors):
@@ -107,20 +109,29 @@ def batch_hard_triplet_loss(
     metric: str = DEFAULT_TRIPLET_METRIC,
 ) -> torch.Tensor:
     _validate_triplet_inputs(features, labels)
-    distances = _pairwise_distances(features, metric)
-    losses, valid = _anchor_losses(distances, labels, margin)
+    # Autocast matmul rounding can cancel nearby squared distances and erase
+    # their gradients after clamping. Mining must use the same FP32 distances.
+    with torch.autocast(device_type=features.device.type, enabled=False):
+        distances = _pairwise_distances(features.float(), metric)
+        losses, valid = _anchor_losses(distances, labels, margin)
     # One host sync per call to honour the documented error. The per-anchor
     # loop this replaced synced once per sample, which dominated step time at
     # ReID-sized PK batches.
     if not bool(torch.any(valid)):
-        raise ValueError("batch_hard_triplet_loss requires at least one valid positive and negative")
+        raise ValueError(
+            "batch_hard_triplet_loss requires at least one valid positive and negative"
+        )
     return losses[valid].mean()
 
 
 def _pairwise_distances(features: torch.Tensor, metric: str) -> torch.Tensor:
     if metric == "euclidean":
         squared_norms = features.pow(2).sum(dim=1)
-        squared = squared_norms.unsqueeze(1) + squared_norms.unsqueeze(0) - 2.0 * features @ features.T
+        squared = (
+            squared_norms.unsqueeze(1)
+            + squared_norms.unsqueeze(0)
+            - 2.0 * features @ features.T
+        )
         return squared.clamp_min(1e-12).sqrt()
     if metric == "cosine":
         return 1.0 - l2_normalize(features) @ l2_normalize(features).T
@@ -150,8 +161,12 @@ def _anchor_losses(
     # enough that ``hardest_positive - hardest_negative`` cannot overflow to
     # -inf on an invalid row even in FP16.
     unreachable = torch.finfo(distances.dtype).max / 4.0
-    hardest_positive = distances.masked_fill(~positive_mask, -unreachable).max(dim=1).values
-    hardest_negative = distances.masked_fill(~negative_mask, unreachable).min(dim=1).values
+    hardest_positive = (
+        distances.masked_fill(~positive_mask, -unreachable).max(dim=1).values
+    )
+    hardest_negative = (
+        distances.masked_fill(~negative_mask, unreachable).min(dim=1).values
+    )
     return F.relu(hardest_positive - hardest_negative + margin), valid
 
 
