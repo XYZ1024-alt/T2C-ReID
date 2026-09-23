@@ -1,11 +1,13 @@
 defaults:
   - train_schema
-  - dataset: msmt17
+  - dataset: prcc
   - _self_
 
 job_builder: t2c_reid.jobs.siglip2_reid:build_training_job
 epochs: 60
 validation_interval: 5
+# Which identities the PRCC holdout draws; used only when validation_holdout_ids > 0.
+validation_holdout_seed: 0
 resume: null
 seed: null
 enable_wandb: false

@@ -10,7 +10,7 @@ from PIL import Image
 from transformers import SiglipConfig, SiglipModel
 
 from t2c_reid.configuration import TrainingConfig, compose_training_config
-from t2c_reid.datasets import ReIDImageBatch
+from t2c_reid.datasets import ReIDImageBatch, collate_reid_batches
 from t2c_reid.jobs.siglip2_reid import (
     BetaSchedule,
     JobDataConfig,
@@ -151,6 +151,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         self.assertIn("alignment_loss", train_metrics)
         self.assertIn("reid_loss", train_metrics)
         self.assertIn("triplet_loss", train_metrics)
+        self.assertIn("triplet_active_fraction", train_metrics)
         self.assertIn("tfc_loss", train_metrics)
         self.assertIn("tfc_local_loss", train_metrics)
         self.assertIn("tfc_global_loss", train_metrics)
@@ -375,6 +376,124 @@ class Siglip2ReIDJobTest(unittest.TestCase):
                 atol=1e-6,
             )
         )
+
+    def test_prcc_bundle_uses_cross_clothes_query_and_same_clothes_extra(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_prcc_fixture(Path(tmp))
+
+            data = load_dataset_bundle(
+                JobDataConfig("prcc", root), FakeSiglip2ImageProcessor()
+            )
+
+        self.assertEqual(data.num_train_ids, 3)
+        self.assertEqual(data.num_cameras, 3)
+        self.assertEqual(len(data.query), 1)
+        self.assertEqual(len(data.gallery), 2)
+        self.assertEqual([name for name, _ in data.extra_queries], ["same_clothes"])
+
+    def test_prcc_holdout_validates_on_training_identities_without_test_split(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_prcc_fixture(Path(tmp), with_test=False)
+
+            data = load_dataset_bundle(
+                JobDataConfig("prcc", root, validation_holdout_ids=1),
+                FakeSiglip2ImageProcessor(),
+            )
+
+        self.assertEqual(data.num_train_ids, 2)
+        self.assertEqual(len(data.query), 2)
+        self.assertEqual(len(data.gallery), 2)
+
+    def test_prcc_validation_reports_same_clothes_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_prcc_fixture(Path(tmp))
+            args = _training_config(root)
+            args.dataset = "prcc"
+
+            job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
+            metrics = job.validate(1)
+
+        self.assertIn(1, metrics.cmc)
+        self.assertIn("same_clothes_mAP", metrics.extras)
+        self.assertIn("same_clothes_rank_1", metrics.extras)
+
+    def test_fused_validation_also_scores_image_only_retrieval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            fused_job = build_training_job(
+                _training_config(root), siglip2_loader=_load_fake_siglip2
+            )
+            image_only_args = _training_config(root)
+            image_only_args.retrieval_mode = IMAGE_ONLY_RETRIEVAL
+            image_only_job = build_training_job(
+                image_only_args, siglip2_loader=_load_fake_siglip2
+            )
+
+            fused = fused_job.validate(1)
+            image_only = image_only_job.validate(1)
+
+        self.assertIn("image_only_mAP", fused.extras)
+        self.assertIn("image_only_rank_1", fused.extras)
+        self.assertNotIn("image_only_mAP", image_only.extras)
+
+    def test_image_only_view_matches_image_only_retrieval_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            job = build_training_job(
+                _training_config(root), siglip2_loader=_load_fake_siglip2
+            )
+            job.model.eval()
+            data = load_dataset_bundle(
+                JobDataConfig("market1501", root),
+                Siglip2ImageTransform(FakeSiglip2ImageProcessor()),
+            )
+            loader = torch.utils.data.DataLoader(
+                data.gallery, batch_size=2, collate_fn=collate_reid_batches
+            )
+
+            both = _extract_features(
+                job.model, loader, torch.device("cpu"), "fused", with_image_only=True
+            )
+            fused = _extract_features(job.model, loader, torch.device("cpu"), "fused")
+            image_only = _extract_features(
+                job.model, loader, torch.device("cpu"), IMAGE_ONLY_RETRIEVAL
+            )
+
+        self.assertTrue(torch.allclose(both.features, fused.features))
+        self.assertTrue(torch.allclose(both.image_only.features, image_only.features))
+        self.assertEqual(both.image_only.person_ids, fused.person_ids)
+
+    def test_prcc_same_clothes_metrics_are_final_epoch_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_prcc_fixture(Path(tmp))
+            args = _training_config(root)
+            args.dataset = "prcc"
+            args.epochs = 2
+
+            job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
+            intermediate = job.validate(1)
+            final = job.validate(2)
+
+        self.assertNotIn("same_clothes_mAP", intermediate.extras)
+        self.assertIn("same_clothes_mAP", final.extras)
+
+    def test_holdout_is_recorded_in_checkpoint_metadata_for_prcc_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prcc_root = _build_prcc_fixture(Path(tmp) / "prcc", with_test=False)
+            market_root = _build_market_fixture(Path(tmp) / "market")
+            prcc_args = _training_config(prcc_root)
+            prcc_args.dataset = "prcc"
+            prcc_args.validation_holdout_ids = 1
+
+            prcc_job = build_training_job(prcc_args, siglip2_loader=_load_fake_siglip2)
+            market_job = build_training_job(
+                _training_config(market_root), siglip2_loader=_load_fake_siglip2
+            )
+
+        self.assertEqual(prcc_job.checkpoint_metadata["validation_holdout_ids"], 1)
+        self.assertEqual(prcc_job.checkpoint_metadata["validation_holdout_seed"], 0)
+        self.assertEqual(prcc_job.checkpoint_metadata["num_train_ids"], 2)
+        self.assertNotIn("validation_holdout_ids", market_job.checkpoint_metadata)
 
     def test_validation_reports_rerank_metrics_when_requested(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1673,6 +1792,23 @@ def _build_market_fixture(root: Path) -> Path:
     _write_market_image(root / "query" / "0003_c1s1_000004_01.jpg", "green")
     _write_market_image(root / "bounding_box_test" / "0003_c2s1_000005_01.jpg", "green")
     _write_market_image(root / "bounding_box_test" / "0004_c1s1_000006_01.jpg", "blue")
+    return root
+
+
+def _build_prcc_fixture(root: Path, *, with_test: bool = True) -> Path:
+    train = root / "rgb" / "train"
+    for pid, color in ((1, "red"), (2, "blue"), (3, "yellow")):
+        for camera in "ABC":
+            for index in range(2):
+                _write_market_image(
+                    train / f"{pid:03d}" / f"{camera}_cropped_rgb{index:03d}.jpg", color
+                )
+    if with_test:
+        test = root / "rgb" / "test"
+        _write_market_image(test / "A" / "004" / "cropped_rgb001.jpg", "green")
+        _write_market_image(test / "A" / "005" / "cropped_rgb002.jpg", "white")
+        _write_market_image(test / "B" / "004" / "cropped_rgb003.jpg", "green")
+        _write_market_image(test / "C" / "004" / "cropped_rgb004.jpg", "black")
     return root
 
 

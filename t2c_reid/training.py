@@ -15,7 +15,7 @@ from torch.nn import functional as F
 
 from t2c_reid.features import l2_normalize
 from t2c_reid.losses import (
-    batch_hard_triplet_loss,
+    batch_hard_triplet,
     siglip_identity_anchor_loss,
     supervised_siglip_loss,
 )
@@ -108,6 +108,7 @@ class Stage2LossBreakdown:
     alignment: torch.Tensor
     identity: torch.Tensor
     triplet: torch.Tensor
+    triplet_active_fraction: torch.Tensor
     tfc: torch.Tensor
     tfc_local: torch.Tensor
     tfc_global: torch.Tensor
@@ -184,7 +185,7 @@ def stage2_loss_breakdown(
         batch.person_ids,
         label_smoothing=inputs.config.label_smoothing,
     )
-    triplet = batch_hard_triplet_loss(
+    triplet = batch_hard_triplet(
         outputs["visual_raw"],
         batch.person_ids,
         inputs.config.triplet_margin,
@@ -196,7 +197,8 @@ def stage2_loss_breakdown(
         return Stage2LossBreakdown(
             alignment=alignment,
             identity=identity,
-            triplet=triplet,
+            triplet=triplet.loss,
+            triplet_active_fraction=triplet.active_fraction,
             tfc=zero,
             tfc_local=zero,
             tfc_global=zero,
@@ -222,7 +224,8 @@ def stage2_loss_breakdown(
     return Stage2LossBreakdown(
         alignment=alignment,
         identity=identity,
-        triplet=triplet,
+        triplet=triplet.loss,
+        triplet_active_fraction=triplet.active_fraction,
         tfc=tfc.total,
         tfc_local=tfc.local,
         tfc_global=tfc.global_center,

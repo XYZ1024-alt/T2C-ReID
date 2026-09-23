@@ -4,6 +4,7 @@ import torch
 
 from t2c_reid.features import l2_normalize
 from t2c_reid.losses import (
+    batch_hard_triplet,
     batch_hard_triplet_loss,
     siglip_identity_anchor_loss,
     supervised_siglip_loss,
@@ -349,6 +350,19 @@ class TrainingLossTest(unittest.TestCase):
         self.assertTrue(torch.allclose(breakdown.triplet, expected))
         self.assertGreater(float(expected.detach()), 0.0)
         self.assertFalse(torch.allclose(breakdown.triplet, headed))
+        self.assertGreater(float(breakdown.triplet_active_fraction), 0.0)
+        self.assertFalse(breakdown.triplet_active_fraction.requires_grad)
+
+    def test_triplet_active_fraction_counts_anchors_with_positive_hinge(self):
+        features = torch.tensor([[0.0], [0.1], [10.0], [10.1]], requires_grad=True)
+        labels = torch.tensor([0, 0, 1, 1])
+
+        inert = batch_hard_triplet(features, labels, margin=0.3)
+        active = batch_hard_triplet(features, labels, margin=20.0)
+
+        self.assertEqual(float(inert.active_fraction), 0.0)
+        self.assertEqual(float(active.active_fraction), 1.0)
+        self.assertTrue(torch.equal(inert.loss, batch_hard_triplet_loss(features, labels, 0.3)))
 
     def test_stage2_triplet_uses_configured_metric(self):
         model = _training_model(beta=0.0)

@@ -14,7 +14,7 @@ from __future__ import annotations
 import hashlib
 import math
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import batched
 from pathlib import Path
 from typing import Any
@@ -24,8 +24,15 @@ from torch.utils.data import DataLoader
 
 from scripts.train import StageMetadata, TrainingJob, TwoStageTrainingJob
 from t2c_reid.anchors import IdentityAnchorProvider
-from t2c_reid.configuration import TrainingConfig
-from t2c_reid.data import ReIDSample, load_market_split, load_msmt17_manifest
+from t2c_reid.configuration import HOLDOUT_DATASETS, TrainingConfig
+from t2c_reid.data import (
+    PRCC_HOLDOUT_SEED,
+    ReIDSample,
+    load_market_split,
+    load_msmt17_manifest,
+    load_prcc_split,
+    split_prcc_holdout,
+)
 from t2c_reid.datasets import (
     DEFAULT_INSTANCES_PER_IDENTITY,
     PYTHON_DATA_BACKEND,
@@ -82,7 +89,9 @@ from t2c_reid.transforms import (
 )
 
 DEFAULT_RANKS = (1, 5, 10)
-SUPPORTED_DATASETS = ("market1501", "msmt17")
+# Extra PRCC query set evaluated against the same gallery; the primary
+# query/mAP is cross-clothes (camera C).
+SAME_CLOTHES_QUERY = "same_clothes"
 PROMPT_TEMPLATE_PREFIX = "a photo of a"
 PROMPT_TEMPLATE_SUFFIX = "person ."
 STAGE1_TRAIN_LOSS_METRIC_NAMES = ("loss", "alignment_loss")
@@ -91,6 +100,7 @@ STAGE2_TRAIN_LOSS_METRIC_NAMES = (
     "alignment_loss",
     "reid_loss",
     "triplet_loss",
+    "triplet_active_fraction",
     "tfc_loss",
     "tfc_local_loss",
     "tfc_global_loss",
@@ -132,6 +142,8 @@ class Siglip2ModelSpec:
 class JobDataConfig:
     dataset: str
     root: Path
+    validation_holdout_ids: int = 0
+    validation_holdout_seed: int = PRCC_HOLDOUT_SEED
 
 
 @dataclass(frozen=True)
@@ -195,6 +207,8 @@ class Siglip2ReIDJobConfig:
     stage1_feature_cache: bool = True
     grad_clip_norm: float = 0.0
     flip_tta: bool = False
+    validation_holdout_ids: int = 0
+    validation_holdout_seed: int = PRCC_HOLDOUT_SEED
 
 
 @dataclass(frozen=True)
@@ -209,6 +223,9 @@ class DatasetBundle:
     num_cameras: int
     identity_counts: torch.Tensor
     identity_camera_counts: torch.Tensor
+    # Named secondary query sets scored against ``gallery`` and reported as
+    # metric extras; the primary ``query`` alone drives mAP and model selection.
+    extra_queries: tuple[tuple[str, ReIDImageDataset | ReIDMetadataDataset], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -216,6 +233,7 @@ class SplitSamples:
     train: Sequence[ReIDSample]
     query: Sequence[ReIDSample]
     gallery: Sequence[ReIDSample]
+    extra_queries: tuple[tuple[str, Sequence[ReIDSample]], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -223,6 +241,7 @@ class LoaderBundle:
     train: DataLoader
     query: DataLoader
     gallery: DataLoader
+    extra_queries: tuple[tuple[str, DataLoader], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -439,6 +458,13 @@ class Siglip2ReIDTrainingModel(torch.nn.Module):
             images, camera_ids, retrieval_mode=retrieval_mode
         )
 
+    def encode_retrieval_views(
+        self,
+        images: torch.Tensor,
+        camera_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.retrieval_model.encode_retrieval_views(images, camera_ids)
+
 
 class BNNeck(torch.nn.Module):
     def __init__(self, feature_dim: int):
@@ -477,7 +503,12 @@ def build_training_job(
         ),
     )
     data = load_dataset_bundle(
-        JobDataConfig(config.dataset, config.data_root),
+        JobDataConfig(
+            config.dataset,
+            config.data_root,
+            config.validation_holdout_ids,
+            config.validation_holdout_seed,
+        ),
         transforms,
         backend=config.data_backend,
     )
@@ -749,9 +780,16 @@ def load_dataset_bundle(
     backend = require_data_backend(backend)
     splits = _load_split_samples(config)
     _require_non_empty_splits(splits)
-    camera_map = build_camera_id_map([*splits.train, *splits.query, *splits.gallery])
+    extra_query_samples = [
+        sample for _, samples in splits.extra_queries for sample in samples
+    ]
+    camera_map = build_camera_id_map(
+        [*splits.train, *splits.query, *splits.gallery, *extra_query_samples]
+    )
     train_person_map = build_person_id_map(splits.train)
-    eval_person_map = build_person_id_map([*splits.query, *splits.gallery])
+    eval_person_map = build_person_id_map(
+        [*splits.query, *splits.gallery, *extra_query_samples]
+    )
     bundle = _transform_bundle(transforms)
     identity_counts, identity_camera_counts = _training_statistics(
         splits.train,
@@ -775,6 +813,15 @@ def load_dataset_bundle(
         num_cameras=len(camera_map),
         identity_counts=identity_counts,
         identity_camera_counts=identity_camera_counts,
+        extra_queries=tuple(
+            (
+                name,
+                _build_image_dataset(
+                    samples, eval_person_map, camera_map, bundle.eval, backend
+                ),
+            )
+            for name, samples in splits.extra_queries
+        ),
     )
 
 
@@ -938,6 +985,8 @@ def _job_config_from_training_config(config: TrainingConfig) -> Siglip2ReIDJobCo
         stage1_feature_cache=config.stage1_feature_cache,
         grad_clip_norm=_validated_grad_clip_norm(config.grad_clip_norm),
         flip_tta=config.flip_tta,
+        validation_holdout_ids=config.validation_holdout_ids,
+        validation_holdout_seed=config.validation_holdout_seed,
     )
 
 
@@ -1287,6 +1336,8 @@ def _stage_metadata(
             "stage2_epochs": config.stage2_epochs,
             "stage2_first_epoch": config.stage2_first_epoch,
             "validation_interval": config.validation_interval,
+            "validation_holdout_ids": config.validation_holdout_ids,
+            "validation_holdout_seed": config.validation_holdout_seed,
             "batch_size": config.batch_size,
             "effective_batch_size": (
                 config.batch_size * config.gradient_accumulation_steps
@@ -1362,6 +1413,21 @@ def _checkpoint_metadata(
     spec: Siglip2ModelSpec,
     data: DatasetBundle,
 ) -> dict[str, Any]:
+    metadata = _base_checkpoint_metadata(config, spec, data)
+    # Recorded only for holdout-capable datasets, so earlier schema-3
+    # Market-1501/MSMT17 checkpoints still resume.
+    if config.dataset in HOLDOUT_DATASETS:
+        metadata["validation_holdout_ids"] = config.validation_holdout_ids
+        if config.validation_holdout_ids:
+            metadata["validation_holdout_seed"] = config.validation_holdout_seed
+    return metadata
+
+
+def _base_checkpoint_metadata(
+    config: Siglip2ReIDJobConfig,
+    spec: Siglip2ModelSpec,
+    data: DatasetBundle,
+) -> dict[str, Any]:
     return {
         "schema_version": 3,
         "backbone_family": "siglip2",
@@ -1414,6 +1480,11 @@ def _pid_camera_count_fingerprint(counts: torch.Tensor) -> str:
 def _load_split_samples(config: JobDataConfig) -> SplitSamples:
     if not config.root.exists():
         raise FileNotFoundError(f"Dataset root does not exist: {config.root}")
+    if config.validation_holdout_ids and config.dataset not in HOLDOUT_DATASETS:
+        raise ValueError(
+            f"validation_holdout_ids is supported only for {HOLDOUT_DATASETS}, "
+            f"got {config.dataset!r}"
+        )
     if config.dataset == "market1501":
         return SplitSamples(
             train=load_market_split(config.root, "train"),
@@ -1430,7 +1501,36 @@ def _load_split_samples(config: JobDataConfig) -> SplitSamples:
             query=load_msmt17_manifest(config.root, "query"),
             gallery=load_msmt17_manifest(config.root, "gallery"),
         )
+    if config.dataset == "prcc":
+        return _load_prcc_split_samples(config)
     raise ValueError(f"Unsupported dataset: {config.dataset}")
+
+
+def _load_prcc_split_samples(config: JobDataConfig) -> SplitSamples:
+    """PRCC CAL protocol: all camera-A gallery, C cross-clothes primary query.
+
+    With ``validation_holdout_ids > 0`` the same protocol runs on identities
+    held out of the training split and the test split is not loaded at all.
+    """
+    train = load_prcc_split(config.root, "train")
+    if config.validation_holdout_ids:
+        holdout = split_prcc_holdout(
+            train, config.validation_holdout_ids, seed=config.validation_holdout_seed
+        )
+        return SplitSamples(
+            train=holdout.train,
+            query=holdout.query_cross,
+            gallery=holdout.gallery,
+            extra_queries=((SAME_CLOTHES_QUERY, holdout.query_same),),
+        )
+    return SplitSamples(
+        train=train,
+        query=load_prcc_split(config.root, "query_cross"),
+        gallery=load_prcc_split(config.root, "gallery"),
+        extra_queries=(
+            (SAME_CLOTHES_QUERY, load_prcc_split(config.root, "query_same")),
+        ),
+    )
 
 
 def _require_non_empty_splits(splits: SplitSamples) -> None:
@@ -1440,6 +1540,9 @@ def _require_non_empty_splits(splits: SplitSamples) -> None:
         raise ValueError("query split is empty")
     if not splits.gallery:
         raise ValueError("gallery split is empty")
+    for name, samples in splits.extra_queries:
+        if not samples:
+            raise ValueError(f"{name} query split is empty")
 
 
 def _build_training_model(
@@ -1580,6 +1683,10 @@ def _build_loaders(data: DatasetBundle, config: Siglip2ReIDJobConfig) -> LoaderB
         train=_train_loader(data.train, config),
         query=_loader(data.query, config, shuffle=False),
         gallery=_loader(data.gallery, config, shuffle=False),
+        extra_queries=tuple(
+            (name, _loader(dataset, config, shuffle=False))
+            for name, dataset in data.extra_queries
+        ),
     )
 
 
@@ -1746,56 +1853,69 @@ def _validate(runtime: ValidationRuntime):
         if runtime.beta_schedule is not None:
             runtime.beta_schedule.apply(runtime.model, epoch)
         runtime.model.eval()
-        query = _extract_features(
-            runtime.model,
-            runtime.loaders.query,
-            runtime.device,
-            runtime.retrieval_mode,
-            runtime.precision,
-            flip_tta=runtime.model_config.flip_tta,
-        )
-        gallery = _extract_features(
-            runtime.model,
-            runtime.loaders.gallery,
-            runtime.device,
-            runtime.retrieval_mode,
-            runtime.precision,
-            flip_tta=runtime.model_config.flip_tta,
-        )
-        metrics = evaluate_reid(
-            query.features,
-            gallery.features,
-            query_ids=query.person_ids,
-            gallery_ids=gallery.person_ids,
-            query_cams=query.camera_ids,
-            gallery_cams=gallery.camera_ids,
-            ranks=DEFAULT_RANKS,
-            backend=runtime.model_config.evaluation_backend,
-            query_chunk_size=runtime.model_config.evaluation_chunk_size,
-        )
-        if not runtime.report_rerank:
-            return metrics
-        rerank = evaluate_reid_with_rerank(
-            query.features,
-            gallery.features,
-            query_ids=query.person_ids,
-            gallery_ids=gallery.person_ids,
-            query_cams=query.camera_ids,
-            gallery_cams=gallery.camera_ids,
-            ranks=DEFAULT_RANKS,
-            backend=runtime.model_config.evaluation_backend,
-            query_chunk_size=runtime.model_config.evaluation_chunk_size,
-        )
-        return ReIDMetrics(
-            map=metrics.map,
-            cmc=metrics.cmc,
-            extras={
-                "rerank_mAP": rerank.map,
-                "rerank_rank_1": rerank.cmc[1],
-            },
-        )
+        query = _validation_features(runtime, runtime.loaders.query)
+        gallery = _validation_features(runtime, runtime.loaders.gallery)
+        metrics = _score_feature_sets(runtime, query, gallery, evaluate_reid)
+        extras: dict[str, float] = {}
+        if query.image_only is not None and gallery.image_only is not None:
+            # Fused-vs-image-only ablation from the same forward pass; the
+            # primary mAP stays the configured retrieval_mode.
+            image_only = _score_feature_sets(
+                runtime, query.image_only, gallery.image_only, evaluate_reid
+            )
+            extras["image_only_mAP"] = image_only.map
+            extras["image_only_rank_1"] = image_only.cmc[1]
+        config = runtime.model_config
+        # Secondary queries never drive model selection, so they are scored
+        # only at the final epoch instead of on every validation pass.
+        final_epoch = config.stage2_first_epoch + config.stage2_epochs - 1
+        extra_queries = runtime.loaders.extra_queries if epoch >= final_epoch else ()
+        for name, loader in extra_queries:
+            extra = _score_feature_sets(
+                runtime, _validation_features(runtime, loader), gallery, evaluate_reid
+            )
+            extras[f"{name}_mAP"] = extra.map
+            extras[f"{name}_rank_1"] = extra.cmc[1]
+        if runtime.report_rerank:
+            rerank = _score_feature_sets(
+                runtime, query, gallery, evaluate_reid_with_rerank
+            )
+            extras["rerank_mAP"] = rerank.map
+            extras["rerank_rank_1"] = rerank.cmc[1]
+        return ReIDMetrics(map=metrics.map, cmc=metrics.cmc, extras=extras)
 
     return validate
+
+
+def _validation_features(runtime: ValidationRuntime, loader: DataLoader) -> FeatureSet:
+    return _extract_features(
+        runtime.model,
+        loader,
+        runtime.device,
+        runtime.retrieval_mode,
+        runtime.precision,
+        flip_tta=runtime.model_config.flip_tta,
+        with_image_only=runtime.retrieval_mode == FUSED_RETRIEVAL,
+    )
+
+
+def _score_feature_sets(
+    runtime: ValidationRuntime,
+    query: FeatureSet,
+    gallery: FeatureSet,
+    evaluate: Callable[..., ReIDMetrics],
+) -> ReIDMetrics:
+    return evaluate(
+        query.features,
+        gallery.features,
+        query_ids=query.person_ids,
+        gallery_ids=gallery.person_ids,
+        query_cams=query.camera_ids,
+        gallery_cams=gallery.camera_ids,
+        ranks=DEFAULT_RANKS,
+        backend=runtime.model_config.evaluation_backend,
+        query_chunk_size=runtime.model_config.evaluation_chunk_size,
+    )
 
 
 @dataclass(frozen=True)
@@ -1803,6 +1923,8 @@ class FeatureSet:
     features: torch.Tensor
     person_ids: tuple[int, ...]
     camera_ids: tuple[int, ...]
+    # Image-only view extracted alongside fused features, when requested.
+    image_only: FeatureSet | None = None
 
 
 def _extract_features(
@@ -1812,37 +1934,56 @@ def _extract_features(
     retrieval_mode: str,
     precision: PrecisionController | None = None,
     flip_tta: bool = False,
+    with_image_only: bool = False,
 ) -> FeatureSet:
+    """Extract retrieval features for one eval loader.
+
+    ``with_image_only`` (fused mode only) also returns the image-only view from
+    the same image forward, so both retrieval modes are scored per validation.
+    """
     if precision is None:
         precision = PrecisionController(PrecisionPolicy("fp32", "fp32", device.type))
-    feature_parts: list[torch.Tensor] = []
+    if with_image_only and retrieval_mode != FUSED_RETRIEVAL:
+        raise ValueError("with_image_only requires fused retrieval_mode")
+
+    def encode(images: torch.Tensor, cameras: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        if with_image_only:
+            image_only, fused = model.encode_retrieval_views(images, cameras)
+            return fused, image_only
+        return (model.encode_retrieval(images, cameras, retrieval_mode=retrieval_mode),)
+
+    view_parts: list[list[torch.Tensor]] = [[] for _ in range(2 if with_image_only else 1)]
     person_ids: list[int] = []
     camera_ids: list[int] = []
     with torch.no_grad(), precision.autocast():
         for batch in loader:
             images = batch.images.to(device, non_blocking=True)
             cameras = batch.camera_ids.to(device, non_blocking=True)
-            features = model.encode_retrieval(
-                images, cameras, retrieval_mode=retrieval_mode
-            )
+            views = encode(images, cameras)
             if flip_tta:
                 # Both views already come back L2-normalized, so summing them
                 # and renormalizing averages the two directions. Doubles eval
                 # cost; training is untouched.
-                flipped = model.encode_retrieval(
-                    torch.flip(images, dims=(3,)),
-                    cameras,
-                    retrieval_mode=retrieval_mode,
+                flipped = encode(torch.flip(images, dims=(3,)), cameras)
+                views = tuple(
+                    l2_normalize(view.float() + flipped_view.float())
+                    for view, flipped_view in zip(views, flipped, strict=True)
                 )
-                features = l2_normalize(features.float() + flipped.float())
-            feature_parts.append(features.float().cpu())
+            for parts, view in zip(view_parts, views, strict=True):
+                parts.append(view.float().cpu())
             person_ids.extend(batch.original_person_ids)
             camera_ids.extend(batch.original_camera_ids)
-    if not feature_parts:
+    if not person_ids:
         raise ValueError(
             "eval loader produced no samples; cannot extract query/gallery features"
         )
-    return FeatureSet(torch.cat(feature_parts), tuple(person_ids), tuple(camera_ids))
+    feature_sets = [
+        FeatureSet(torch.cat(parts), tuple(person_ids), tuple(camera_ids))
+        for parts in view_parts
+    ]
+    if with_image_only:
+        return replace(feature_sets[0], image_only=feature_sets[1])
+    return feature_sets[0]
 
 
 def _training_batch(batch: ReIDImageBatch, device: torch.device) -> TrainingBatch:
@@ -1949,6 +2090,9 @@ def _stage2_metric_values(breakdown: Stage2LossBreakdown) -> dict[str, float]:
         "loss": _tensor_metric_value(breakdown.total),
         "reid_loss": _tensor_metric_value(breakdown.identity),
         "triplet_loss": _tensor_metric_value(breakdown.triplet),
+        "triplet_active_fraction": _tensor_metric_value(
+            breakdown.triplet_active_fraction
+        ),
         "alignment_loss": _tensor_metric_value(breakdown.alignment),
         "tfc_loss": _tensor_metric_value(breakdown.tfc),
         "tfc_local_loss": _tensor_metric_value(breakdown.tfc_local),

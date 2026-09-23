@@ -32,7 +32,12 @@ from t2c_reid.configuration import (
     benchmark_config_from_dict_config,
     compose_benchmark_config,
 )
-from t2c_reid.data import ReIDSample, load_market_split, load_msmt17_manifest
+from t2c_reid.data import (
+    ReIDSample,
+    load_market_split,
+    load_msmt17_manifest,
+    load_prcc_split,
+)
 from t2c_reid.datasets import (
     ReIDImageDataset,
     ReIDImageDatasetConfig,
@@ -443,6 +448,8 @@ def _synthetic_samples(count: int, seed: int):
 def _load_real_samples(dataset: str, root: Path, limit: int) -> list[ReIDSample]:
     if dataset == "market1501":
         samples = load_market_split(root, "train")
+    elif dataset == "prcc":
+        samples = load_prcc_split(root, "train")
     else:
         samples = [
             *load_msmt17_manifest(root, "train"),

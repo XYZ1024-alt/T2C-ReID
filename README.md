@@ -7,7 +7,7 @@ the foundation vision-language model is **SigLIP 2 So400m**.
 The implementation uses a two-stage training pipeline:
 
 - `google/siglip2-so400m-patch14-384` image and text towers.
-- Market-1501 and MSMT17 person/camera parsing.
+- PRCC (default, clothes-changing), Market-1501, and MSMT17 person/camera parsing.
 - Global, camera, and training-identity learnable prompts in the SigLIP 2 text
   token embedding space.
 - Stage-1 supervised SigLIP alignment between image features and identity-aware
@@ -45,8 +45,10 @@ training prompt  = global + camera + identity
 inference prompt = global + camera
 ```
 
-`--retrieval-mode image_only` returns normalized `FeatureHead(f_v_raw)` without
-the text branch. `--retrieval-mode fused` uses the inference prompt above.
+`retrieval_mode=image_only` returns normalized `FeatureHead(f_v_raw)` without
+the text branch. `retrieval_mode=fused` uses the inference prompt above. Fused
+validation also scores the image-only view from the same image forward and
+reports it as `image_only_mAP` / `image_only_rank_1`.
 
 ## Environment
 
@@ -78,12 +80,47 @@ Core requirements are declared in `pyproject.toml`:
 The first real run downloads the selected Hugging Face checkpoint, which is
 several GB for So400m.
 
+### Rented GPU Hosts (AutoDL)
+
+- Use a GPU with at least 32GB. The default Stage-2 recipe needs roughly 29GB
+  (DESIGN.md section 8), so a 24GB card runs out of memory. Lowering
+  `batch_size` is not a free fix: it also shrinks the PK triplet/SigLIP mining
+  scope.
+- PyTorch comes from the CUDA 13.2 wheel index in `pyproject.toml` (already a
+  mainland mirror); `nvidia-smi` must report a driver that supports CUDA 13.x.
+- Reach Hugging Face through a mirror and keep the multi-GB model cache, the
+  dataset, and checkpoints on the data disk rather than the system disk:
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+export HF_HOME=/root/autodl-tmp/hf-cache
+mkdir -p /root/autodl-tmp/data && ln -s /root/autodl-tmp/data data   # holds data/prcc
+uv run train checkpoint_dir=/root/autodl-tmp/checkpoints/prcc-tune
+```
+
 ## Data
 
 Supported datasets:
 
+- `prcc` (default)
 - `market1501`
 - `msmt17`
+
+PRCC uses the RGB modality at `data/prcc` (`sketch/` is ignored):
+
+```text
+prcc/rgb/
+  train/<pid>/{A,B,C}_cropped_rgb*.jpg
+  test/{A,B,C}/<pid>/cropped_rgb*.jpg
+```
+
+Cameras A and B share clothes; C shows changed clothes. Evaluation follows the
+CAL multi-shot protocol: every `test/A` image is the gallery, `test/C` is the
+**cross-clothes** query that defines the primary `mAP`/`rank1`, and `test/B`
+is the same-clothes query reported as `same_clothes_mAP` /
+`same_clothes_rank_1` at the final Stage-2 epoch only (it never drives model
+selection, so intermediate validations skip its extra forward pass). Training uses `rgb/train` only; `rgb/val` holds more
+images of the same 150 training identities and is not used.
 
 Market-1501 expects the standard directories:
 
@@ -99,22 +136,78 @@ training split combines `list_train.txt` and `list_val.txt`.
 
 ## Training
 
-With MSMT17 placed at `data/MSMT17_V1`, start the complete default recipe with:
+With PRCC placed at `data/prcc`, start a tuning run of the default recipe with:
 
 ```bash
 uv run train
 ```
 
 The default run uses Stage-1 for 60 epochs, Stage-2 for 60 epochs, validates
-every 5 Stage-2 epochs, and writes to `checkpoints/msmt17-siglip2-tfc`.
+every 5 Stage-2 epochs, and writes to `checkpoints/prcc-siglip2-tfc`.
+
+PRCC model selection never reads the test split. By default
+`validation_holdout_ids=20` holds 20 whole training identities out of the
+training split (a fixed seed, so every run shares them) and validates on them
+with the same A-gallery / C-query / B-query protocol; `best.pth` tracks that
+holdout `mAP`.
+
+The holdout has 20 identities and a small gallery (718 images), so its absolute
+mAP runs higher than on test and differences of about one point are within
+noise. Confirm a decision that hinges on a small gap by repeating both arms with
+another `validation_holdout_seed` (a different set of held-out identities).
+
+Choose the Stage-2 epoch count by comparing the **final-epoch** holdout mAP of
+separate runs (`epochs=40`, `60`, `80`, ...), not by reading the epoch of
+`best.pth` inside one run: the cosine schedule is stretched over `epochs`, so
+epoch 40 of a 60-epoch run has not annealed the way the last epoch of a 40-epoch
+run has.
+
+After choosing hyperparameters and the epoch count on the holdout, train once
+on all 150 identities and evaluate the test split only at the final epoch. Pass
+the chosen Stage-2 epoch count to both `epochs` and `validation_interval`, and a
+separate `checkpoint_dir` so the tuning run's checkpoints are not overwritten:
+
+```bash
+uv run train \
+  validation_holdout_ids=0 \
+  epochs=60 \
+  validation_interval=60 \
+  checkpoint_dir=checkpoints/prcc-final \
+  run_name=prcc-final
+```
+
+With `validation_holdout_ids=0`, PRCC rejects any `validation_interval` below
+`epochs`: the only validation is the final epoch, so the reported test metrics
+are never selected on test labels.
+
+### First PRCC Calibration Run
+
+The defaults were calibrated on MSMT17. Read these from the first holdout run
+before tuning anything else:
+
+- **Fused vs image-only.** Every PRCC gallery image is camera A and every
+  primary query is camera C, so the camera text adds one identity-agnostic
+  offset per side instead of correcting per-gallery-camera bias as on MSMT17.
+  Compare `mAP` with `image_only_mAP`. If image-only is at least as good, train
+  with `retrieval_mode=image_only freeze_prompt_bank_stage2=true`: the camera
+  text is then encoded once and cached instead of back-propagating through the
+  text tower every Stage-2 step, and the reported result no longer relies on
+  the camera C = changed-clothes metadata.
+- **Triplet margin.** `triplet_active_fraction` is the share of anchors whose
+  euclidean batch-hard hinge is still positive. If it stays near zero, the
+  `0.3` margin is inert at the `visual_raw` scale; switch to
+  `triplet_metric=cosine`.
+- **Alignment weight.** PRCC trains 130 (holdout) or 150 identities instead of
+  1041, so compare `alignment_loss` with `reid_loss` + `triplet_loss` and
+  retune `alignment_weight` if alignment dominates.
+
 Only specify values that differ from the baseline recipe. For example:
 
 ```bash
 uv run train \
-  data_root=D:/datasets/MSMT17_V1 \
   tfc_weight=0.5 \
   alignment_weight=0.25 \
-  run_name=msmt17-tfc-weight-sweep
+  run_name=prcc-tfc-weight-sweep
 ```
 
 Training parameters are composed by Hydra from
@@ -122,6 +215,7 @@ Training parameters are composed by Hydra from
 the `dataset` config group:
 
 ```bash
+uv run train dataset=msmt17
 uv run train dataset=market1501
 uv run train --cfg job
 uv run train --help
@@ -132,7 +226,7 @@ Hydra overrides use `snake_case=value`; the former argparse-style
 directory unchanged and writes its resolved config and override provenance
 under the ignored `runs/hydra/` tree.
 
-The defaults select MSMT17 at `data/MSMT17_V1`, the fixed model, `392x196`
+The defaults select PRCC at `data/prcc` with a 20-identity validation holdout, the fixed model, `392x196`
 input, Stage-1 `60`, Stage-2 `60`, batch `64` with `4` instances per identity,
 accumulation `1`, eval batch `128`, cosine learning rates with a `5`-epoch
 warmup in both stages, BNNeck, automatic precision, and gradient checkpointing.
@@ -146,9 +240,9 @@ accumulation does not widen it. At `batch_size=8 num_instances=2` the PK
 sampler yields `P=4` identities with `K=2` instances, so every batch-hard
 triplet anchor has exactly **one** positive and six negatives — the mining
 degenerates into "take the only positive". The default is now the standard ReID
-`P=16 x K=4`. MSMT17's rarest training identity has 6 images, so `K=4` drops no
-identities; on Market-1501, 15 of 751 identities have fewer than 4 images and
-are skipped by `IdentityBalancedBatchSampler`.
+`P=16 x K=4`. PRCC's rarest training identity has 52 images and MSMT17's has
+6, so `K=4` drops no identities; on Market-1501, 15 of 751 identities have
+fewer than 4 images and are skipped by `IdentityBalancedBatchSampler`.
 
 Since `len(sampler) == len(labels) // batch_size`, a larger batch means
 proportionally fewer iterations over the same images per epoch, so epoch cost is
@@ -269,12 +363,15 @@ falling back. FP16 scaler state is saved and restored with the checkpoint.
 Run and data defaults:
 
 - `uv run train`
-- `dataset=msmt17` (config group: `msmt17|market1501`)
-- `data_root=data/MSMT17_V1`
+- `dataset=prcc` (config group: `prcc|msmt17|market1501`)
+- `data_root=data/prcc`
+- `validation_holdout_ids=20` (PRCC only; `0` trains on every identity and
+  validates on the test split, which requires `validation_interval >= epochs`)
+- `validation_holdout_seed=0` (which identities the holdout draws)
 - `stage1_epochs=60`
 - `epochs=60` (Stage-2 epochs)
 - `validation_interval=5`
-- `checkpoint_dir=checkpoints/msmt17-siglip2-tfc`
+- `checkpoint_dir=checkpoints/prcc-siglip2-tfc`
 - `job_builder=t2c_reid.jobs.siglip2_reid:build_training_job`
 
 Backbone and input:
@@ -360,7 +457,7 @@ New checkpoints use schema version 3 and include:
 Resume a Stage-2 run with the same architecture and precision:
 
 ```bash
-uv run train resume=checkpoints/msmt17-siglip2-tfc/last.pth
+uv run train resume=checkpoints/prcc-siglip2-tfc/last.pth
 ```
 
 This migration intentionally rejects schema 2 Stage-2 checkpoints, OpenAI CLIP
@@ -378,17 +475,19 @@ uv run wandb login
 uv run train \
   enable_wandb=true \
   wandb_project=T2C-ReID \
-  run_name=msmt17-siglip2-camera-tfc
+  run_name=prcc-siglip2-camera-tfc
 ```
 
 Training metrics include:
 
 - Stage-1: `loss`, `alignment_loss`, `lr`
-- Stage-2: `loss`, `alignment_loss`, `reid_loss`, `triplet_loss`, `tfc_loss`,
-  `tfc_local_loss`, `tfc_global_loss`, `tfc_cross_modal_loss`,
-  `tfc_cross_camera_loss`, `tfc_transfer_reg_loss`,
+- Stage-2: `loss`, `alignment_loss`, `reid_loss`, `triplet_loss`,
+  `triplet_active_fraction`, `tfc_loss`, `tfc_local_loss`, `tfc_global_loss`,
+  `tfc_cross_modal_loss`, `tfc_cross_camera_loss`, `tfc_transfer_reg_loss`,
   `tfc_cross_camera_coverage`, `lr`
-- Validation: `mAP`, `best_mAP`, `rank_1`, `rank_5`, `rank_10`
+- Validation: `mAP`, `best_mAP`, `rank_1`, `rank_5`, `rank_10`; fused mode adds
+  `image_only_mAP` / `image_only_rank_1`; PRCC adds `same_clothes_mAP` /
+  `same_clothes_rank_1` at the final Stage-2 epoch
 
 `stage1_train_step` and `stage2_train_step` count successful optimizer update
 windows, not micro-batches. Window metrics are means across their constituent
@@ -457,7 +556,7 @@ uv run python -m t2c_reid.cli.benchmark_native \
 
 Benchmark parameters come from
 `t2c_reid/configs/benchmark/benchmark.yaml`. Use real training images by adding
-`dataset=market1501|msmt17 data_root=PATH`. The benchmark defaults to two Rust
+`dataset=prcc|market1501|msmt17 data_root=PATH`. The benchmark defaults to two Rust
 threads per data worker because that
 was the first configuration to clear the synthetic throughput gate; production
 training uses `rust_data_threads=2` by default and should be

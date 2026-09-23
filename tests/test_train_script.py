@@ -211,15 +211,17 @@ class TrainScriptTest(unittest.TestCase):
             config.job_builder,
             "t2c_reid.jobs.siglip2_reid:build_training_job",
         )
-        self.assertEqual(config.dataset, "msmt17")
-        self.assertEqual(config.data_root, Path("data/MSMT17_V1"))
+        self.assertEqual(config.dataset, "prcc")
+        self.assertEqual(config.data_root, Path("data/prcc"))
+        self.assertEqual(config.validation_holdout_ids, 20)
+        self.assertEqual(config.validation_holdout_seed, 0)
         self.assertEqual(config.stage1_epochs, 60)
         self.assertEqual(config.epochs, 60)
         self.assertEqual(
             config.checkpoint_dir,
-            Path("checkpoints/msmt17-siglip2-tfc"),
+            Path("checkpoints/prcc-siglip2-tfc"),
         )
-        self.assertEqual(config.run_name, "msmt17-siglip2-camera-tfc")
+        self.assertEqual(config.run_name, "prcc-siglip2-camera-tfc")
 
     def test_dataset_config_group_updates_related_paths(self):
         config = compose_training_config(["dataset=market1501"])
@@ -231,6 +233,21 @@ class TrainScriptTest(unittest.TestCase):
             Path("checkpoints/market1501-siglip2-tfc"),
         )
         self.assertEqual(config.run_name, "market1501-siglip2-camera-tfc")
+        self.assertEqual(config.validation_holdout_ids, 0)
+
+    def test_validation_holdout_is_rejected_outside_prcc(self):
+        with self.assertRaisesRegex(ValueError, "validation_holdout_ids"):
+            compose_training_config(["dataset=msmt17", "validation_holdout_ids=5"])
+
+    def test_prcc_test_split_validation_is_final_epoch_only(self):
+        with self.assertRaisesRegex(ValueError, "validation_interval must be >= epochs"):
+            compose_training_config(["validation_holdout_ids=0"])
+
+        config = compose_training_config(
+            ["validation_holdout_ids=0", "epochs=80", "validation_interval=80"]
+        )
+
+        self.assertEqual(config.validation_holdout_ids, 0)
 
     def test_main_runs_builder_training_job_and_saves_checkpoints(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -299,8 +316,8 @@ class TrainScriptTest(unittest.TestCase):
 
         self.assertEqual(RECORDED_CONFIG.image_encoder_lr, 5e-6)
         self.assertEqual(RECORDED_CONFIG.stage1_epochs, 60)
-        self.assertEqual(RECORDED_CONFIG.dataset, "msmt17")
-        self.assertEqual(RECORDED_CONFIG.data_root, Path("data/MSMT17_V1"))
+        self.assertEqual(RECORDED_CONFIG.dataset, "prcc")
+        self.assertEqual(RECORDED_CONFIG.data_root, Path("data/prcc"))
         # P=16 x K=4: batch-size is the real triplet/SigLIP mining scope and
         # gradient accumulation does not widen it, so accumulation is 1.
         self.assertEqual(RECORDED_CONFIG.batch_size, 64)
