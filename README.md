@@ -98,7 +98,8 @@ Cameras A and B share clothes; C shows changed clothes. Evaluation follows the
 CAL multi-shot protocol: every `test/A` image is the gallery, `test/C` is the
 **cross-clothes** query that defines the primary `mAP`/`rank1`, and `test/B`
 is the same-clothes query reported as `same_clothes_mAP` /
-`same_clothes_rank_1`. Training uses `rgb/train` only; `rgb/val` holds more
+`same_clothes_rank_1` at the final Stage-2 epoch only (it never drives model
+selection, so intermediate validations skip its extra forward pass). Training uses `rgb/train` only; `rgb/val` holds more
 images of the same 150 training identities and is not used.
 
 Market-1501 expects the standard directories:
@@ -130,17 +131,22 @@ training split (a fixed seed, so every run shares them) and validates on them
 with the same A-gallery / C-query / B-query protocol; `best.pth` tracks that
 holdout `mAP`. After choosing hyperparameters and the epoch count on the
 holdout, train once on all 150 identities and evaluate the test split only at
-the final epoch:
+the final epoch. Pass the chosen Stage-2 epoch count to both `epochs` and
+`validation_interval`, and a separate `checkpoint_dir` so the tuning run's
+checkpoints are not overwritten:
 
 ```bash
 uv run train \
   validation_holdout_ids=0 \
+  epochs=60 \
   validation_interval=60 \
+  checkpoint_dir=checkpoints/prcc-final \
   run_name=prcc-final
 ```
 
-With `validation_interval` equal to `epochs`, the only validation is the final
-epoch, so the reported test metrics are not selected on test labels.
+With `validation_holdout_ids=0`, PRCC rejects any `validation_interval` below
+`epochs`: the only validation is the final epoch, so the reported test metrics
+are never selected on test labels.
 
 Only specify values that differ from the baseline recipe. For example:
 
@@ -307,7 +313,7 @@ Run and data defaults:
 - `dataset=prcc` (config group: `prcc|msmt17|market1501`)
 - `data_root=data/prcc`
 - `validation_holdout_ids=20` (PRCC only; `0` trains on every identity and
-  validates on the test split)
+  validates on the test split, which requires `validation_interval >= epochs`)
 - `stage1_epochs=60`
 - `epochs=60` (Stage-2 epochs)
 - `validation_interval=5`

@@ -141,10 +141,18 @@ def split_prcc_holdout(
             held_out_samples, PRCC_CROSS_CLOTHES_CAMERA, "query_cross"
         ),
     )
-    gallery_ids = {sample.person_id for sample in splits.gallery}
-    missing = sorted(pid for pid in held_out if pid not in gallery_ids)
-    if missing:
-        raise ValueError(f"PRCC holdout identities have no camera-A gallery images: {missing}")
+    # Camera B is optional: one real PRCC training identity has no B images,
+    # which only thins the secondary same-clothes query.
+    for camera, split_samples in (
+        (PRCC_GALLERY_CAMERA, splits.gallery),
+        (PRCC_CROSS_CLOTHES_CAMERA, splits.query_cross),
+    ):
+        present = {sample.person_id for sample in split_samples}
+        missing = sorted(held_out - present)
+        if missing:
+            raise ValueError(
+                f"PRCC holdout identities have no camera-{camera} images: {missing}"
+            )
     return splits
 
 

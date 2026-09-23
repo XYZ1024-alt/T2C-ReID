@@ -238,6 +238,16 @@ class TrainScriptTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "validation_holdout_ids"):
             compose_training_config(["dataset=msmt17", "validation_holdout_ids=5"])
 
+    def test_prcc_test_split_validation_is_final_epoch_only(self):
+        with self.assertRaisesRegex(ValueError, "validation_interval must be >= epochs"):
+            compose_training_config(["validation_holdout_ids=0"])
+
+        config = compose_training_config(
+            ["validation_holdout_ids=0", "epochs=80", "validation_interval=80"]
+        )
+
+        self.assertEqual(config.validation_holdout_ids, 0)
+
     def test_main_runs_builder_training_job_and_saves_checkpoints(self):
         with tempfile.TemporaryDirectory() as tmp:
             checkpoint_dir = Path(tmp) / "checkpoints"

@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader
 
 from scripts.train import StageMetadata, TrainingJob, TwoStageTrainingJob
 from t2c_reid.anchors import IdentityAnchorProvider
-from t2c_reid.configuration import TrainingConfig
+from t2c_reid.configuration import HOLDOUT_DATASETS, TrainingConfig
 from t2c_reid.data import (
     ReIDSample,
     load_market_split,
@@ -88,7 +88,6 @@ from t2c_reid.transforms import (
 )
 
 DEFAULT_RANKS = (1, 5, 10)
-SUPPORTED_DATASETS = ("market1501", "msmt17", "prcc")
 # Extra PRCC query set evaluated against the same gallery; the primary
 # query/mAP is cross-clothes (camera C).
 SAME_CLOTHES_QUERY = "same_clothes"
@@ -1396,6 +1395,19 @@ def _checkpoint_metadata(
     spec: Siglip2ModelSpec,
     data: DatasetBundle,
 ) -> dict[str, Any]:
+    metadata = _base_checkpoint_metadata(config, spec, data)
+    # Recorded only for holdout-capable datasets, so earlier schema-3
+    # Market-1501/MSMT17 checkpoints still resume.
+    if config.dataset in HOLDOUT_DATASETS:
+        metadata["validation_holdout_ids"] = config.validation_holdout_ids
+    return metadata
+
+
+def _base_checkpoint_metadata(
+    config: Siglip2ReIDJobConfig,
+    spec: Siglip2ModelSpec,
+    data: DatasetBundle,
+) -> dict[str, Any]:
     return {
         "schema_version": 3,
         "backbone_family": "siglip2",
@@ -1448,9 +1460,10 @@ def _pid_camera_count_fingerprint(counts: torch.Tensor) -> str:
 def _load_split_samples(config: JobDataConfig) -> SplitSamples:
     if not config.root.exists():
         raise FileNotFoundError(f"Dataset root does not exist: {config.root}")
-    if config.validation_holdout_ids and config.dataset != "prcc":
+    if config.validation_holdout_ids and config.dataset not in HOLDOUT_DATASETS:
         raise ValueError(
-            f"validation_holdout_ids is supported only for prcc, got {config.dataset!r}"
+            f"validation_holdout_ids is supported only for {HOLDOUT_DATASETS}, "
+            f"got {config.dataset!r}"
         )
     if config.dataset == "market1501":
         return SplitSamples(
@@ -1822,7 +1835,12 @@ def _validate(runtime: ValidationRuntime):
         gallery = _validation_features(runtime, runtime.loaders.gallery)
         metrics = _score_feature_sets(runtime, query, gallery, evaluate_reid)
         extras: dict[str, float] = {}
-        for name, loader in runtime.loaders.extra_queries:
+        config = runtime.model_config
+        # Secondary queries never drive model selection, so they are scored
+        # only at the final epoch instead of on every validation pass.
+        final_epoch = config.stage2_first_epoch + config.stage2_epochs - 1
+        extra_queries = runtime.loaders.extra_queries if epoch >= final_epoch else ()
+        for name, loader in extra_queries:
             extra = _score_feature_sets(
                 runtime, _validation_features(runtime, loader), gallery, evaluate_reid
             )

@@ -424,15 +424,17 @@ Stage-1 cache、anchor/camera cache、训练和验证使用同一 precision cont
 
 默认数据集是 PRCC（RGB），采用 CAL multi-shot 协议：`test/A` 全部图像为 gallery，
 `test/C`（换衣）为主 query，决定 `mAP`/`rank1` 与 `best.pth`；`test/B`（同衣）作为
-额外 query 对同一 gallery 评估，报告为 `same_clothes_mAP` / `same_clothes_rank_1`。
+额外 query 对同一 gallery 评估，报告为 `same_clothes_mAP` / `same_clothes_rank_1`；
+它不参与模型选择，只在最终 Stage-2 epoch 计算。
 A/B/C 同时是 camera ID，camera prompt 与 SIE 按标准 camera 元数据使用。训练只用
 `rgb/train`。
 
 模型选择不得读取 test 标签。`validation_holdout_ids > 0`（PRCC 默认 20）按固定种子
-从训练集整体留出身份，以同样的 A/C/B 协议验证，且完全不加载 test split；调参结束后以
-`validation_holdout_ids=0` 在全部训练身份上重训，并令 `validation_interval` 等于
-`epochs`，只在最终 epoch 评估 test。留出身份改变训练集，因此由 pid-camera fingerprint
-阻止跨设置 resume。
+从训练集整体留出身份，以同样的 A/C/B 协议验证（留出身份必须有 A 和 C 图像，B 可缺），
+且完全不加载 test split；调参结束后以 `validation_holdout_ids=0` 在全部训练身份上重训，
+配置校验强制 `validation_interval >= epochs`，只在最终 epoch 评估 test。PRCC
+checkpoint metadata 记录 `validation_holdout_ids`，与 pid-camera fingerprint 一起阻止
+跨设置 resume；Market-1501/MSMT17 metadata 不含该键，保持既有 schema 3 checkpoint 可续训。
 
 `flip_tta` 默认关闭。开启时对每张 query/gallery 图像额外前向一次水平镜像视图，把两个
 已归一化特征相加后重新归一化，评估成本翻倍。这相对本项目主结果表所对比的公开

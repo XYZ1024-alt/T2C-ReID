@@ -261,6 +261,18 @@ def validate_training_config(config: TrainingConfig) -> None:
             f"validation_holdout_ids is supported only for {HOLDOUT_DATASETS}, "
             f"got dataset {config.dataset!r}"
         )
+    if (
+        config.dataset in HOLDOUT_DATASETS
+        and config.validation_holdout_ids == 0
+        and config.validation_interval < config.epochs
+    ):
+        # Without a holdout the validation set is the test split; validating
+        # before the final epoch would select best.pth on test labels.
+        raise ValueError(
+            f"{config.dataset} with validation_holdout_ids=0 evaluates the test "
+            "split, so validation_interval must be >= epochs (final epoch only); "
+            f"got validation_interval={config.validation_interval}, epochs={config.epochs}"
+        )
 
 
 def validate_evaluation_config(config: EvaluationConfig) -> None:

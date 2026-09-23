@@ -94,3 +94,22 @@ class DataParsingTest(unittest.TestCase):
         self.assertEqual({sample.split for sample in first.query_cross}, {"query_cross"})
         with self.assertRaises(ValueError):
             split_prcc_holdout(samples, 10)
+
+    def test_split_prcc_holdout_requires_cross_clothes_images_but_not_same_clothes(self):
+        without_same_clothes = [
+            ReIDSample(Path(f"{pid}/{cam}.jpg"), pid, cam, "prcc", "train")
+            for pid in range(2)
+            for cam in (1, 3)
+        ]
+        without_cross_clothes = [
+            ReIDSample(Path(f"{pid}/{cam}.jpg"), pid, cam, "prcc", "train")
+            for pid in range(2)
+            for cam in (1, 2)
+        ]
+
+        splits = split_prcc_holdout(without_same_clothes, 1)
+
+        self.assertEqual(splits.query_same, [])
+        self.assertEqual(len(splits.query_cross), 1)
+        with self.assertRaisesRegex(ValueError, "camera-C"):
+            split_prcc_holdout(without_cross_clothes, 1)

@@ -193,7 +193,7 @@ same-camera gallery exclusion. PRCC (default) uses the CAL multi-shot protocol:
 all `test/A` gallery, `test/C` cross-clothes primary query, `test/B`
 same-clothes extra query. Model selection uses the ID-disjoint training
 holdout; the test split is evaluated only by a final `validation_holdout_ids=0`
-run with `validation_interval` equal to `epochs`. Torch computes normalized score/distance blocks;
+run, which config validation forces to use `validation_interval >= epochs`. Torch computes normalized score/distance blocks;
 Rust performs deterministic ranking and metric aggregation. Exact sparse
 k-reciprocal reranking is optional and must not replace primary mAP/CMC.
 

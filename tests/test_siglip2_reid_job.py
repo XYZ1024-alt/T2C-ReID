@@ -416,6 +416,37 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         self.assertIn("same_clothes_mAP", metrics.extras)
         self.assertIn("same_clothes_rank_1", metrics.extras)
 
+    def test_prcc_same_clothes_metrics_are_final_epoch_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_prcc_fixture(Path(tmp))
+            args = _training_config(root)
+            args.dataset = "prcc"
+            args.epochs = 2
+
+            job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
+            intermediate = job.validate(1)
+            final = job.validate(2)
+
+        self.assertNotIn("same_clothes_mAP", intermediate.extras)
+        self.assertIn("same_clothes_mAP", final.extras)
+
+    def test_holdout_is_recorded_in_checkpoint_metadata_for_prcc_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prcc_root = _build_prcc_fixture(Path(tmp) / "prcc", with_test=False)
+            market_root = _build_market_fixture(Path(tmp) / "market")
+            prcc_args = _training_config(prcc_root)
+            prcc_args.dataset = "prcc"
+            prcc_args.validation_holdout_ids = 1
+
+            prcc_job = build_training_job(prcc_args, siglip2_loader=_load_fake_siglip2)
+            market_job = build_training_job(
+                _training_config(market_root), siglip2_loader=_load_fake_siglip2
+            )
+
+        self.assertEqual(prcc_job.checkpoint_metadata["validation_holdout_ids"], 1)
+        self.assertEqual(prcc_job.checkpoint_metadata["num_train_ids"], 2)
+        self.assertNotIn("validation_holdout_ids", market_job.checkpoint_metadata)
+
     def test_validation_reports_rerank_metrics_when_requested(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))

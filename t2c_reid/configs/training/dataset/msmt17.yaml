@@ -2,4 +2,5 @@
 dataset: msmt17
 data_root: data/MSMT17_V1
 checkpoint_dir: checkpoints/msmt17-siglip2-tfc
+validation_holdout_ids: 0
 run_name: msmt17-siglip2-camera-tfc
