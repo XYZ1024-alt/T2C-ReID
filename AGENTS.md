@@ -73,7 +73,7 @@ T2C-ReID/
 |   |-- precision.py           Precision policy, autocast, and GradScaler
 |   |-- tfc.py                 Camera-aware visual/text prototype bank and TFC losses
 |   |-- transforms.py          SigLIP-normalized train/eval image transforms
-|   |-- data.py                Market-1501/MSMT17 parsing
+|   |-- data.py                PRCC/Market-1501/MSMT17 parsing and PRCC holdout
 |   |-- datasets.py            Python reference dataset and Rust batch collator
 |   |-- native.py              Mandatory native ABI/version check
 |   |-- evaluation.py          Chunked Rust mAP/CMC and sparse rerank dispatch
@@ -121,7 +121,8 @@ the full unittest suite, compileall, CLI help, and `git diff --check`.
 uv run train
 ```
 
-Important defaults target a 32GB single GPU: MSMT17 at `data/MSMT17_V1`,
+Important defaults target a 32GB single GPU: PRCC at `data/prcc` with a
+20-identity validation holdout (`validation_holdout_ids`),
 Stage-1 60 epochs, Stage-2 60 epochs, train batch 64 with 4 instances per
 identity (`P=16 x K=4`), gradient accumulation 1, eval batch 128, cosine
 learning rates with a 5-epoch warmup in both stages, BNNeck feature head,
@@ -188,7 +189,11 @@ training-only. Camera retrieval text and identity anchors are cached only when
 their prompt and text dependencies are frozen.
 
 Primary evaluation is no-rerank cosine retrieval with standard same-ID,
-same-camera gallery exclusion. Torch computes normalized score/distance blocks;
+same-camera gallery exclusion. PRCC (default) uses the CAL multi-shot protocol:
+all `test/A` gallery, `test/C` cross-clothes primary query, `test/B`
+same-clothes extra query. Model selection uses the ID-disjoint training
+holdout; the test split is evaluated only by a final `validation_holdout_ids=0`
+run with `validation_interval` equal to `epochs`. Torch computes normalized score/distance blocks;
 Rust performs deterministic ranking and metric aggregation. Exact sparse
 k-reciprocal reranking is optional and must not replace primary mAP/CMC.
 

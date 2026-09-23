@@ -376,6 +376,46 @@ class Siglip2ReIDJobTest(unittest.TestCase):
             )
         )
 
+    def test_prcc_bundle_uses_cross_clothes_query_and_same_clothes_extra(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_prcc_fixture(Path(tmp))
+
+            data = load_dataset_bundle(
+                JobDataConfig("prcc", root), FakeSiglip2ImageProcessor()
+            )
+
+        self.assertEqual(data.num_train_ids, 3)
+        self.assertEqual(data.num_cameras, 3)
+        self.assertEqual(len(data.query), 1)
+        self.assertEqual(len(data.gallery), 2)
+        self.assertEqual([name for name, _ in data.extra_queries], ["same_clothes"])
+
+    def test_prcc_holdout_validates_on_training_identities_without_test_split(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_prcc_fixture(Path(tmp), with_test=False)
+
+            data = load_dataset_bundle(
+                JobDataConfig("prcc", root, validation_holdout_ids=1),
+                FakeSiglip2ImageProcessor(),
+            )
+
+        self.assertEqual(data.num_train_ids, 2)
+        self.assertEqual(len(data.query), 2)
+        self.assertEqual(len(data.gallery), 2)
+
+    def test_prcc_validation_reports_same_clothes_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_prcc_fixture(Path(tmp))
+            args = _training_config(root)
+            args.dataset = "prcc"
+
+            job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
+            metrics = job.validate(1)
+
+        self.assertIn(1, metrics.cmc)
+        self.assertIn("same_clothes_mAP", metrics.extras)
+        self.assertIn("same_clothes_rank_1", metrics.extras)
+
     def test_validation_reports_rerank_metrics_when_requested(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
@@ -1673,6 +1713,23 @@ def _build_market_fixture(root: Path) -> Path:
     _write_market_image(root / "query" / "0003_c1s1_000004_01.jpg", "green")
     _write_market_image(root / "bounding_box_test" / "0003_c2s1_000005_01.jpg", "green")
     _write_market_image(root / "bounding_box_test" / "0004_c1s1_000006_01.jpg", "blue")
+    return root
+
+
+def _build_prcc_fixture(root: Path, *, with_test: bool = True) -> Path:
+    train = root / "rgb" / "train"
+    for pid, color in ((1, "red"), (2, "blue"), (3, "yellow")):
+        for camera in "ABC":
+            for index in range(2):
+                _write_market_image(
+                    train / f"{pid:03d}" / f"{camera}_cropped_rgb{index:03d}.jpg", color
+                )
+    if with_test:
+        test = root / "rgb" / "test"
+        _write_market_image(test / "A" / "004" / "cropped_rgb001.jpg", "green")
+        _write_market_image(test / "A" / "005" / "cropped_rgb002.jpg", "white")
+        _write_market_image(test / "B" / "004" / "cropped_rgb003.jpg", "green")
+        _write_market_image(test / "C" / "004" / "cropped_rgb004.jpg", "black")
     return root
 
 

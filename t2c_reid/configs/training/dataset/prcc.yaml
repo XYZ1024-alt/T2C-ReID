@@ -1,0 +1,8 @@
+# @package _global_
+dataset: prcc
+data_root: data/prcc
+# Tune on 20 ID-disjoint training identities; set 0 for the final full-train
+# run, which then evaluates the PRCC test protocol.
+validation_holdout_ids: 20
+checkpoint_dir: checkpoints/prcc-siglip2-tfc
+run_name: prcc-siglip2-camera-tfc

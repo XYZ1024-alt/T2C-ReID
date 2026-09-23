@@ -23,7 +23,8 @@ BENCHMARK_CONFIG_MODULE = "t2c_reid.configs.benchmark"
 TRAIN_CONFIG_NAME = "train"
 EVALUATE_CONFIG_NAME = "evaluate"
 BENCHMARK_CONFIG_NAME = "benchmark"
-SUPPORTED_DATASETS = ("market1501", "msmt17")
+SUPPORTED_DATASETS = ("market1501", "msmt17", "prcc")
+HOLDOUT_DATASETS = ("prcc",)
 SUPPORTED_BENCHMARK_MODES = ("all", "data", "evaluation", "rerank")
 SUPPORTED_LR_SCHEDULERS = ("none", "cosine")
 SUPPORTED_REID_HEADS = ("linear", "bnneck")
@@ -49,6 +50,7 @@ class TrainingConfig:
     run_name: str
     dataset: str
     data_root: Path
+    validation_holdout_ids: int
     siglip2_model_name: str
     siglip2_checkpoint: Path | None
     batch_size: int
@@ -251,6 +253,13 @@ def validate_training_config(config: TrainingConfig) -> None:
         raise ValueError(
             f"siglip2_model_name must be {SIGLIP2_MODEL_ID!r}, "
             f"got {config.siglip2_model_name!r}"
+        )
+    if config.validation_holdout_ids < 0:
+        raise ValueError("validation_holdout_ids must be non-negative")
+    if config.validation_holdout_ids > 0 and config.dataset not in HOLDOUT_DATASETS:
+        raise ValueError(
+            f"validation_holdout_ids is supported only for {HOLDOUT_DATASETS}, "
+            f"got dataset {config.dataset!r}"
         )
 
 

@@ -10,6 +10,7 @@ rust/target/
 .coverage
 htmlcov/
 
+/data/
 MSMT17_V1/
 MSMT17_V1.zip
 Market-1501/

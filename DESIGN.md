@@ -375,7 +375,7 @@ grad clip norm = 5.0
 `batch-size` 是真实 pairwise / triplet mining 范围，梯度累积不会扩展它。因此默认
 recipe 把整个 PK batch 放进单个 micro-batch，累积固定为 1。`batch-size 8` 且
 `num-instances 2` 时每个 batch-hard anchor 只有 1 个正样本和 6 个负样本，挖掘退化，
-这是必须避免的配置。MSMT17 最少的训练身份有 6 张图，`K=4` 不丢身份；Market-1501 有
+这是必须避免的配置。PRCC 最少的训练身份有 52 张图，MSMT17 有 6 张，`K=4` 均不丢身份；Market-1501 有
 15/751 个身份不足 4 张，会被 `IdentityBalancedBatchSampler` 跳过。
 
 Stage-2 显存量级（默认 recipe）：静态约 13GB（全部参数 FP32、视觉塔的梯度与 AdamW
@@ -421,6 +421,18 @@ Stage-1 cache、anchor/camera cache、训练和验证使用同一 precision cont
 
 标准协议排除同身份同 camera gallery。主指标始终是无 rerank mAP/CMC；rerank 只能作为
 额外报告，不能覆盖主指标。
+
+默认数据集是 PRCC（RGB），采用 CAL multi-shot 协议：`test/A` 全部图像为 gallery，
+`test/C`（换衣）为主 query，决定 `mAP`/`rank1` 与 `best.pth`；`test/B`（同衣）作为
+额外 query 对同一 gallery 评估，报告为 `same_clothes_mAP` / `same_clothes_rank_1`。
+A/B/C 同时是 camera ID，camera prompt 与 SIE 按标准 camera 元数据使用。训练只用
+`rgb/train`。
+
+模型选择不得读取 test 标签。`validation_holdout_ids > 0`（PRCC 默认 20）按固定种子
+从训练集整体留出身份，以同样的 A/C/B 协议验证，且完全不加载 test split；调参结束后以
+`validation_holdout_ids=0` 在全部训练身份上重训，并令 `validation_interval` 等于
+`epochs`，只在最终 epoch 评估 test。留出身份改变训练集，因此由 pid-camera fingerprint
+阻止跨设置 resume。
 
 `flip_tta` 默认关闭。开启时对每张 query/gallery 图像额外前向一次水平镜像视图，把两个
 已归一化特征相加后重新归一化，评估成本翻倍。这相对本项目主结果表所对比的公开

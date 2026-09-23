@@ -25,7 +25,13 @@ from torch.utils.data import DataLoader
 from scripts.train import StageMetadata, TrainingJob, TwoStageTrainingJob
 from t2c_reid.anchors import IdentityAnchorProvider
 from t2c_reid.configuration import TrainingConfig
-from t2c_reid.data import ReIDSample, load_market_split, load_msmt17_manifest
+from t2c_reid.data import (
+    ReIDSample,
+    load_market_split,
+    load_msmt17_manifest,
+    load_prcc_split,
+    split_prcc_holdout,
+)
 from t2c_reid.datasets import (
     DEFAULT_INSTANCES_PER_IDENTITY,
     PYTHON_DATA_BACKEND,
@@ -82,7 +88,10 @@ from t2c_reid.transforms import (
 )
 
 DEFAULT_RANKS = (1, 5, 10)
-SUPPORTED_DATASETS = ("market1501", "msmt17")
+SUPPORTED_DATASETS = ("market1501", "msmt17", "prcc")
+# Extra PRCC query set evaluated against the same gallery; the primary
+# query/mAP is cross-clothes (camera C).
+SAME_CLOTHES_QUERY = "same_clothes"
 PROMPT_TEMPLATE_PREFIX = "a photo of a"
 PROMPT_TEMPLATE_SUFFIX = "person ."
 STAGE1_TRAIN_LOSS_METRIC_NAMES = ("loss", "alignment_loss")
@@ -132,6 +141,7 @@ class Siglip2ModelSpec:
 class JobDataConfig:
     dataset: str
     root: Path
+    validation_holdout_ids: int = 0
 
 
 @dataclass(frozen=True)
@@ -195,6 +205,7 @@ class Siglip2ReIDJobConfig:
     stage1_feature_cache: bool = True
     grad_clip_norm: float = 0.0
     flip_tta: bool = False
+    validation_holdout_ids: int = 0
 
 
 @dataclass(frozen=True)
@@ -209,6 +220,9 @@ class DatasetBundle:
     num_cameras: int
     identity_counts: torch.Tensor
     identity_camera_counts: torch.Tensor
+    # Named secondary query sets scored against ``gallery`` and reported as
+    # metric extras; the primary ``query`` alone drives mAP and model selection.
+    extra_queries: tuple[tuple[str, ReIDImageDataset | ReIDMetadataDataset], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -216,6 +230,7 @@ class SplitSamples:
     train: Sequence[ReIDSample]
     query: Sequence[ReIDSample]
     gallery: Sequence[ReIDSample]
+    extra_queries: tuple[tuple[str, Sequence[ReIDSample]], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -223,6 +238,7 @@ class LoaderBundle:
     train: DataLoader
     query: DataLoader
     gallery: DataLoader
+    extra_queries: tuple[tuple[str, DataLoader], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -477,7 +493,7 @@ def build_training_job(
         ),
     )
     data = load_dataset_bundle(
-        JobDataConfig(config.dataset, config.data_root),
+        JobDataConfig(config.dataset, config.data_root, config.validation_holdout_ids),
         transforms,
         backend=config.data_backend,
     )
@@ -749,9 +765,16 @@ def load_dataset_bundle(
     backend = require_data_backend(backend)
     splits = _load_split_samples(config)
     _require_non_empty_splits(splits)
-    camera_map = build_camera_id_map([*splits.train, *splits.query, *splits.gallery])
+    extra_query_samples = [
+        sample for _, samples in splits.extra_queries for sample in samples
+    ]
+    camera_map = build_camera_id_map(
+        [*splits.train, *splits.query, *splits.gallery, *extra_query_samples]
+    )
     train_person_map = build_person_id_map(splits.train)
-    eval_person_map = build_person_id_map([*splits.query, *splits.gallery])
+    eval_person_map = build_person_id_map(
+        [*splits.query, *splits.gallery, *extra_query_samples]
+    )
     bundle = _transform_bundle(transforms)
     identity_counts, identity_camera_counts = _training_statistics(
         splits.train,
@@ -775,6 +798,15 @@ def load_dataset_bundle(
         num_cameras=len(camera_map),
         identity_counts=identity_counts,
         identity_camera_counts=identity_camera_counts,
+        extra_queries=tuple(
+            (
+                name,
+                _build_image_dataset(
+                    samples, eval_person_map, camera_map, bundle.eval, backend
+                ),
+            )
+            for name, samples in splits.extra_queries
+        ),
     )
 
 
@@ -938,6 +970,7 @@ def _job_config_from_training_config(config: TrainingConfig) -> Siglip2ReIDJobCo
         stage1_feature_cache=config.stage1_feature_cache,
         grad_clip_norm=_validated_grad_clip_norm(config.grad_clip_norm),
         flip_tta=config.flip_tta,
+        validation_holdout_ids=config.validation_holdout_ids,
     )
 
 
@@ -1287,6 +1320,7 @@ def _stage_metadata(
             "stage2_epochs": config.stage2_epochs,
             "stage2_first_epoch": config.stage2_first_epoch,
             "validation_interval": config.validation_interval,
+            "validation_holdout_ids": config.validation_holdout_ids,
             "batch_size": config.batch_size,
             "effective_batch_size": (
                 config.batch_size * config.gradient_accumulation_steps
@@ -1414,6 +1448,10 @@ def _pid_camera_count_fingerprint(counts: torch.Tensor) -> str:
 def _load_split_samples(config: JobDataConfig) -> SplitSamples:
     if not config.root.exists():
         raise FileNotFoundError(f"Dataset root does not exist: {config.root}")
+    if config.validation_holdout_ids and config.dataset != "prcc":
+        raise ValueError(
+            f"validation_holdout_ids is supported only for prcc, got {config.dataset!r}"
+        )
     if config.dataset == "market1501":
         return SplitSamples(
             train=load_market_split(config.root, "train"),
@@ -1430,7 +1468,34 @@ def _load_split_samples(config: JobDataConfig) -> SplitSamples:
             query=load_msmt17_manifest(config.root, "query"),
             gallery=load_msmt17_manifest(config.root, "gallery"),
         )
+    if config.dataset == "prcc":
+        return _load_prcc_split_samples(config)
     raise ValueError(f"Unsupported dataset: {config.dataset}")
+
+
+def _load_prcc_split_samples(config: JobDataConfig) -> SplitSamples:
+    """PRCC CAL protocol: all camera-A gallery, C cross-clothes primary query.
+
+    With ``validation_holdout_ids > 0`` the same protocol runs on identities
+    held out of the training split and the test split is not loaded at all.
+    """
+    train = load_prcc_split(config.root, "train")
+    if config.validation_holdout_ids:
+        holdout = split_prcc_holdout(train, config.validation_holdout_ids)
+        return SplitSamples(
+            train=holdout.train,
+            query=holdout.query_cross,
+            gallery=holdout.gallery,
+            extra_queries=((SAME_CLOTHES_QUERY, holdout.query_same),),
+        )
+    return SplitSamples(
+        train=train,
+        query=load_prcc_split(config.root, "query_cross"),
+        gallery=load_prcc_split(config.root, "gallery"),
+        extra_queries=(
+            (SAME_CLOTHES_QUERY, load_prcc_split(config.root, "query_same")),
+        ),
+    )
 
 
 def _require_non_empty_splits(splits: SplitSamples) -> None:
@@ -1440,6 +1505,9 @@ def _require_non_empty_splits(splits: SplitSamples) -> None:
         raise ValueError("query split is empty")
     if not splits.gallery:
         raise ValueError("gallery split is empty")
+    for name, samples in splits.extra_queries:
+        if not samples:
+            raise ValueError(f"{name} query split is empty")
 
 
 def _build_training_model(
@@ -1580,6 +1648,10 @@ def _build_loaders(data: DatasetBundle, config: Siglip2ReIDJobConfig) -> LoaderB
         train=_train_loader(data.train, config),
         query=_loader(data.query, config, shuffle=False),
         gallery=_loader(data.gallery, config, shuffle=False),
+        extra_queries=tuple(
+            (name, _loader(dataset, config, shuffle=False))
+            for name, dataset in data.extra_queries
+        ),
     )
 
 
@@ -1746,56 +1818,55 @@ def _validate(runtime: ValidationRuntime):
         if runtime.beta_schedule is not None:
             runtime.beta_schedule.apply(runtime.model, epoch)
         runtime.model.eval()
-        query = _extract_features(
-            runtime.model,
-            runtime.loaders.query,
-            runtime.device,
-            runtime.retrieval_mode,
-            runtime.precision,
-            flip_tta=runtime.model_config.flip_tta,
-        )
-        gallery = _extract_features(
-            runtime.model,
-            runtime.loaders.gallery,
-            runtime.device,
-            runtime.retrieval_mode,
-            runtime.precision,
-            flip_tta=runtime.model_config.flip_tta,
-        )
-        metrics = evaluate_reid(
-            query.features,
-            gallery.features,
-            query_ids=query.person_ids,
-            gallery_ids=gallery.person_ids,
-            query_cams=query.camera_ids,
-            gallery_cams=gallery.camera_ids,
-            ranks=DEFAULT_RANKS,
-            backend=runtime.model_config.evaluation_backend,
-            query_chunk_size=runtime.model_config.evaluation_chunk_size,
-        )
-        if not runtime.report_rerank:
-            return metrics
-        rerank = evaluate_reid_with_rerank(
-            query.features,
-            gallery.features,
-            query_ids=query.person_ids,
-            gallery_ids=gallery.person_ids,
-            query_cams=query.camera_ids,
-            gallery_cams=gallery.camera_ids,
-            ranks=DEFAULT_RANKS,
-            backend=runtime.model_config.evaluation_backend,
-            query_chunk_size=runtime.model_config.evaluation_chunk_size,
-        )
-        return ReIDMetrics(
-            map=metrics.map,
-            cmc=metrics.cmc,
-            extras={
-                "rerank_mAP": rerank.map,
-                "rerank_rank_1": rerank.cmc[1],
-            },
-        )
+        query = _validation_features(runtime, runtime.loaders.query)
+        gallery = _validation_features(runtime, runtime.loaders.gallery)
+        metrics = _score_feature_sets(runtime, query, gallery, evaluate_reid)
+        extras: dict[str, float] = {}
+        for name, loader in runtime.loaders.extra_queries:
+            extra = _score_feature_sets(
+                runtime, _validation_features(runtime, loader), gallery, evaluate_reid
+            )
+            extras[f"{name}_mAP"] = extra.map
+            extras[f"{name}_rank_1"] = extra.cmc[1]
+        if runtime.report_rerank:
+            rerank = _score_feature_sets(
+                runtime, query, gallery, evaluate_reid_with_rerank
+            )
+            extras["rerank_mAP"] = rerank.map
+            extras["rerank_rank_1"] = rerank.cmc[1]
+        return ReIDMetrics(map=metrics.map, cmc=metrics.cmc, extras=extras)
 
     return validate
+
+
+def _validation_features(runtime: ValidationRuntime, loader: DataLoader) -> FeatureSet:
+    return _extract_features(
+        runtime.model,
+        loader,
+        runtime.device,
+        runtime.retrieval_mode,
+        runtime.precision,
+        flip_tta=runtime.model_config.flip_tta,
+    )
+
+
+def _score_feature_sets(
+    runtime: ValidationRuntime,
+    query: FeatureSet,
+    gallery: FeatureSet,
+    evaluate: Callable[..., ReIDMetrics],
+) -> ReIDMetrics:
+    return evaluate(
+        query.features,
+        gallery.features,
+        query_ids=query.person_ids,
+        gallery_ids=gallery.person_ids,
+        query_cams=query.camera_ids,
+        gallery_cams=gallery.camera_ids,
+        ranks=DEFAULT_RANKS,
+        backend=runtime.model_config.evaluation_backend,
+        query_chunk_size=runtime.model_config.evaluation_chunk_size,
+    )
 
 
 @dataclass(frozen=True)
