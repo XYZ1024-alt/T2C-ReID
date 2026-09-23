@@ -14,7 +14,7 @@ from __future__ import annotations
 import hashlib
 import math
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import batched
 from pathlib import Path
 from typing import Any
@@ -26,6 +26,7 @@ from scripts.train import StageMetadata, TrainingJob, TwoStageTrainingJob
 from t2c_reid.anchors import IdentityAnchorProvider
 from t2c_reid.configuration import HOLDOUT_DATASETS, TrainingConfig
 from t2c_reid.data import (
+    PRCC_HOLDOUT_SEED,
     ReIDSample,
     load_market_split,
     load_msmt17_manifest,
@@ -99,6 +100,7 @@ STAGE2_TRAIN_LOSS_METRIC_NAMES = (
     "alignment_loss",
     "reid_loss",
     "triplet_loss",
+    "triplet_active_fraction",
     "tfc_loss",
     "tfc_local_loss",
     "tfc_global_loss",
@@ -141,6 +143,7 @@ class JobDataConfig:
     dataset: str
     root: Path
     validation_holdout_ids: int = 0
+    validation_holdout_seed: int = PRCC_HOLDOUT_SEED
 
 
 @dataclass(frozen=True)
@@ -205,6 +208,7 @@ class Siglip2ReIDJobConfig:
     grad_clip_norm: float = 0.0
     flip_tta: bool = False
     validation_holdout_ids: int = 0
+    validation_holdout_seed: int = PRCC_HOLDOUT_SEED
 
 
 @dataclass(frozen=True)
@@ -454,6 +458,13 @@ class Siglip2ReIDTrainingModel(torch.nn.Module):
             images, camera_ids, retrieval_mode=retrieval_mode
         )
 
+    def encode_retrieval_views(
+        self,
+        images: torch.Tensor,
+        camera_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.retrieval_model.encode_retrieval_views(images, camera_ids)
+
 
 class BNNeck(torch.nn.Module):
     def __init__(self, feature_dim: int):
@@ -492,7 +503,12 @@ def build_training_job(
         ),
     )
     data = load_dataset_bundle(
-        JobDataConfig(config.dataset, config.data_root, config.validation_holdout_ids),
+        JobDataConfig(
+            config.dataset,
+            config.data_root,
+            config.validation_holdout_ids,
+            config.validation_holdout_seed,
+        ),
         transforms,
         backend=config.data_backend,
     )
@@ -970,6 +986,7 @@ def _job_config_from_training_config(config: TrainingConfig) -> Siglip2ReIDJobCo
         grad_clip_norm=_validated_grad_clip_norm(config.grad_clip_norm),
         flip_tta=config.flip_tta,
         validation_holdout_ids=config.validation_holdout_ids,
+        validation_holdout_seed=config.validation_holdout_seed,
     )
 
 
@@ -1320,6 +1337,7 @@ def _stage_metadata(
             "stage2_first_epoch": config.stage2_first_epoch,
             "validation_interval": config.validation_interval,
             "validation_holdout_ids": config.validation_holdout_ids,
+            "validation_holdout_seed": config.validation_holdout_seed,
             "batch_size": config.batch_size,
             "effective_batch_size": (
                 config.batch_size * config.gradient_accumulation_steps
@@ -1400,6 +1418,8 @@ def _checkpoint_metadata(
     # Market-1501/MSMT17 checkpoints still resume.
     if config.dataset in HOLDOUT_DATASETS:
         metadata["validation_holdout_ids"] = config.validation_holdout_ids
+        if config.validation_holdout_ids:
+            metadata["validation_holdout_seed"] = config.validation_holdout_seed
     return metadata
 
 
@@ -1494,7 +1514,9 @@ def _load_prcc_split_samples(config: JobDataConfig) -> SplitSamples:
     """
     train = load_prcc_split(config.root, "train")
     if config.validation_holdout_ids:
-        holdout = split_prcc_holdout(train, config.validation_holdout_ids)
+        holdout = split_prcc_holdout(
+            train, config.validation_holdout_ids, seed=config.validation_holdout_seed
+        )
         return SplitSamples(
             train=holdout.train,
             query=holdout.query_cross,
@@ -1835,6 +1857,14 @@ def _validate(runtime: ValidationRuntime):
         gallery = _validation_features(runtime, runtime.loaders.gallery)
         metrics = _score_feature_sets(runtime, query, gallery, evaluate_reid)
         extras: dict[str, float] = {}
+        if query.image_only is not None and gallery.image_only is not None:
+            # Fused-vs-image-only ablation from the same forward pass; the
+            # primary mAP stays the configured retrieval_mode.
+            image_only = _score_feature_sets(
+                runtime, query.image_only, gallery.image_only, evaluate_reid
+            )
+            extras["image_only_mAP"] = image_only.map
+            extras["image_only_rank_1"] = image_only.cmc[1]
         config = runtime.model_config
         # Secondary queries never drive model selection, so they are scored
         # only at the final epoch instead of on every validation pass.
@@ -1865,6 +1895,7 @@ def _validation_features(runtime: ValidationRuntime, loader: DataLoader) -> Feat
         runtime.retrieval_mode,
         runtime.precision,
         flip_tta=runtime.model_config.flip_tta,
+        with_image_only=runtime.retrieval_mode == FUSED_RETRIEVAL,
     )
 
 
@@ -1892,6 +1923,8 @@ class FeatureSet:
     features: torch.Tensor
     person_ids: tuple[int, ...]
     camera_ids: tuple[int, ...]
+    # Image-only view extracted alongside fused features, when requested.
+    image_only: FeatureSet | None = None
 
 
 def _extract_features(
@@ -1901,37 +1934,56 @@ def _extract_features(
     retrieval_mode: str,
     precision: PrecisionController | None = None,
     flip_tta: bool = False,
+    with_image_only: bool = False,
 ) -> FeatureSet:
+    """Extract retrieval features for one eval loader.
+
+    ``with_image_only`` (fused mode only) also returns the image-only view from
+    the same image forward, so both retrieval modes are scored per validation.
+    """
     if precision is None:
         precision = PrecisionController(PrecisionPolicy("fp32", "fp32", device.type))
-    feature_parts: list[torch.Tensor] = []
+    if with_image_only and retrieval_mode != FUSED_RETRIEVAL:
+        raise ValueError("with_image_only requires fused retrieval_mode")
+
+    def encode(images: torch.Tensor, cameras: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        if with_image_only:
+            image_only, fused = model.encode_retrieval_views(images, cameras)
+            return fused, image_only
+        return (model.encode_retrieval(images, cameras, retrieval_mode=retrieval_mode),)
+
+    view_parts: list[list[torch.Tensor]] = [[] for _ in range(2 if with_image_only else 1)]
     person_ids: list[int] = []
     camera_ids: list[int] = []
     with torch.no_grad(), precision.autocast():
         for batch in loader:
             images = batch.images.to(device, non_blocking=True)
             cameras = batch.camera_ids.to(device, non_blocking=True)
-            features = model.encode_retrieval(
-                images, cameras, retrieval_mode=retrieval_mode
-            )
+            views = encode(images, cameras)
             if flip_tta:
                 # Both views already come back L2-normalized, so summing them
                 # and renormalizing averages the two directions. Doubles eval
                 # cost; training is untouched.
-                flipped = model.encode_retrieval(
-                    torch.flip(images, dims=(3,)),
-                    cameras,
-                    retrieval_mode=retrieval_mode,
+                flipped = encode(torch.flip(images, dims=(3,)), cameras)
+                views = tuple(
+                    l2_normalize(view.float() + flipped_view.float())
+                    for view, flipped_view in zip(views, flipped, strict=True)
                 )
-                features = l2_normalize(features.float() + flipped.float())
-            feature_parts.append(features.float().cpu())
+            for parts, view in zip(view_parts, views, strict=True):
+                parts.append(view.float().cpu())
             person_ids.extend(batch.original_person_ids)
             camera_ids.extend(batch.original_camera_ids)
-    if not feature_parts:
+    if not person_ids:
         raise ValueError(
             "eval loader produced no samples; cannot extract query/gallery features"
         )
-    return FeatureSet(torch.cat(feature_parts), tuple(person_ids), tuple(camera_ids))
+    feature_sets = [
+        FeatureSet(torch.cat(parts), tuple(person_ids), tuple(camera_ids))
+        for parts in view_parts
+    ]
+    if with_image_only:
+        return replace(feature_sets[0], image_only=feature_sets[1])
+    return feature_sets[0]
 
 
 def _training_batch(batch: ReIDImageBatch, device: torch.device) -> TrainingBatch:
@@ -2038,6 +2090,9 @@ def _stage2_metric_values(breakdown: Stage2LossBreakdown) -> dict[str, float]:
         "loss": _tensor_metric_value(breakdown.total),
         "reid_loss": _tensor_metric_value(breakdown.identity),
         "triplet_loss": _tensor_metric_value(breakdown.triplet),
+        "triplet_active_fraction": _tensor_metric_value(
+            breakdown.triplet_active_fraction
+        ),
         "alignment_loss": _tensor_metric_value(breakdown.alignment),
         "tfc_loss": _tensor_metric_value(breakdown.tfc),
         "tfc_local_loss": _tensor_metric_value(breakdown.tfc_local),

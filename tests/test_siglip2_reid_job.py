@@ -10,7 +10,7 @@ from PIL import Image
 from transformers import SiglipConfig, SiglipModel
 
 from t2c_reid.configuration import TrainingConfig, compose_training_config
-from t2c_reid.datasets import ReIDImageBatch
+from t2c_reid.datasets import ReIDImageBatch, collate_reid_batches
 from t2c_reid.jobs.siglip2_reid import (
     BetaSchedule,
     JobDataConfig,
@@ -151,6 +151,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         self.assertIn("alignment_loss", train_metrics)
         self.assertIn("reid_loss", train_metrics)
         self.assertIn("triplet_loss", train_metrics)
+        self.assertIn("triplet_active_fraction", train_metrics)
         self.assertIn("tfc_loss", train_metrics)
         self.assertIn("tfc_local_loss", train_metrics)
         self.assertIn("tfc_global_loss", train_metrics)
@@ -416,6 +417,52 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         self.assertIn("same_clothes_mAP", metrics.extras)
         self.assertIn("same_clothes_rank_1", metrics.extras)
 
+    def test_fused_validation_also_scores_image_only_retrieval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            fused_job = build_training_job(
+                _training_config(root), siglip2_loader=_load_fake_siglip2
+            )
+            image_only_args = _training_config(root)
+            image_only_args.retrieval_mode = IMAGE_ONLY_RETRIEVAL
+            image_only_job = build_training_job(
+                image_only_args, siglip2_loader=_load_fake_siglip2
+            )
+
+            fused = fused_job.validate(1)
+            image_only = image_only_job.validate(1)
+
+        self.assertIn("image_only_mAP", fused.extras)
+        self.assertIn("image_only_rank_1", fused.extras)
+        self.assertNotIn("image_only_mAP", image_only.extras)
+
+    def test_image_only_view_matches_image_only_retrieval_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            job = build_training_job(
+                _training_config(root), siglip2_loader=_load_fake_siglip2
+            )
+            job.model.eval()
+            data = load_dataset_bundle(
+                JobDataConfig("market1501", root),
+                Siglip2ImageTransform(FakeSiglip2ImageProcessor()),
+            )
+            loader = torch.utils.data.DataLoader(
+                data.gallery, batch_size=2, collate_fn=collate_reid_batches
+            )
+
+            both = _extract_features(
+                job.model, loader, torch.device("cpu"), "fused", with_image_only=True
+            )
+            fused = _extract_features(job.model, loader, torch.device("cpu"), "fused")
+            image_only = _extract_features(
+                job.model, loader, torch.device("cpu"), IMAGE_ONLY_RETRIEVAL
+            )
+
+        self.assertTrue(torch.allclose(both.features, fused.features))
+        self.assertTrue(torch.allclose(both.image_only.features, image_only.features))
+        self.assertEqual(both.image_only.person_ids, fused.person_ids)
+
     def test_prcc_same_clothes_metrics_are_final_epoch_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_prcc_fixture(Path(tmp))
@@ -444,6 +491,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
             )
 
         self.assertEqual(prcc_job.checkpoint_metadata["validation_holdout_ids"], 1)
+        self.assertEqual(prcc_job.checkpoint_metadata["validation_holdout_seed"], 0)
         self.assertEqual(prcc_job.checkpoint_metadata["num_train_ids"], 2)
         self.assertNotIn("validation_holdout_ids", market_job.checkpoint_metadata)
 

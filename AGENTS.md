@@ -145,8 +145,8 @@ the dataset or feature scale changes:
   The negatives are saturated and contribute almost nothing at initialization.
 - `triplet_margin`: batch-hard triplet runs on **unnormalized** `visual_raw`
   with a euclidean metric, so a `0.3` margin is meaningful only while
-  `||visual_raw||` is small. Measure the fraction of anchors with a non-zero
-  hinge; if it is near zero the term is inert and `triplet_metric=cosine`
+  `||visual_raw||` is small. Read the fraction of anchors with a non-zero
+  hinge from the Stage-2 `triplet_active_fraction` metric; if it is near zero the term is inert and `triplet_metric=cosine`
   (well scaled for a `[0, 2]` distance) is the right correction.
 
 ### Feature Evaluation

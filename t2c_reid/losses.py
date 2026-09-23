@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from torch.nn import functional as F
 
@@ -102,12 +104,29 @@ def _siglip_pairwise_loss(
         return -F.logsigmoid(signs * logits).sum(dim=1).mean()
 
 
+@dataclass(frozen=True)
+class TripletLossResult:
+    loss: torch.Tensor
+    # Detached share of valid anchors whose hinge is still positive. Near zero
+    # means the margin is inert at the current feature scale.
+    active_fraction: torch.Tensor
+
+
 def batch_hard_triplet_loss(
     features: torch.Tensor,
     labels: torch.Tensor,
     margin: float = DEFAULT_MARGIN,
     metric: str = DEFAULT_TRIPLET_METRIC,
 ) -> torch.Tensor:
+    return batch_hard_triplet(features, labels, margin, metric).loss
+
+
+def batch_hard_triplet(
+    features: torch.Tensor,
+    labels: torch.Tensor,
+    margin: float = DEFAULT_MARGIN,
+    metric: str = DEFAULT_TRIPLET_METRIC,
+) -> TripletLossResult:
     _validate_triplet_inputs(features, labels)
     # Autocast matmul rounding can cancel nearby squared distances and erase
     # their gradients after clamping. Mining must use the same FP32 distances.
@@ -121,7 +140,11 @@ def batch_hard_triplet_loss(
         raise ValueError(
             "batch_hard_triplet_loss requires at least one valid positive and negative"
         )
-    return losses[valid].mean()
+    valid_losses = losses[valid]
+    return TripletLossResult(
+        loss=valid_losses.mean(),
+        active_fraction=(valid_losses > 0).float().mean().detach(),
+    )
 
 
 def _pairwise_distances(features: torch.Tensor, metric: str) -> torch.Tensor:

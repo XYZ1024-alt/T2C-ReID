@@ -51,6 +51,7 @@ class TrainingConfig:
     dataset: str
     data_root: Path
     validation_holdout_ids: int
+    validation_holdout_seed: int
     siglip2_model_name: str
     siglip2_checkpoint: Path | None
     batch_size: int

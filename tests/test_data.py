@@ -94,6 +94,11 @@ class DataParsingTest(unittest.TestCase):
         self.assertEqual({sample.split for sample in first.query_cross}, {"query_cross"})
         with self.assertRaises(ValueError):
             split_prcc_holdout(samples, 10)
+        reseeded = {
+            frozenset(sample.person_id for sample in split_prcc_holdout(samples, 3, seed=seed).gallery)
+            for seed in range(5)
+        }
+        self.assertGreater(len(reseeded), 1)
 
     def test_split_prcc_holdout_requires_cross_clothes_images_but_not_same_clothes(self):
         without_same_clothes = [

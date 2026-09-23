@@ -214,6 +214,7 @@ class TrainScriptTest(unittest.TestCase):
         self.assertEqual(config.dataset, "prcc")
         self.assertEqual(config.data_root, Path("data/prcc"))
         self.assertEqual(config.validation_holdout_ids, 20)
+        self.assertEqual(config.validation_holdout_seed, 0)
         self.assertEqual(config.stage1_epochs, 60)
         self.assertEqual(config.epochs, 60)
         self.assertEqual(

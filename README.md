@@ -45,8 +45,10 @@ training prompt  = global + camera + identity
 inference prompt = global + camera
 ```
 
-`--retrieval-mode image_only` returns normalized `FeatureHead(f_v_raw)` without
-the text branch. `--retrieval-mode fused` uses the inference prompt above.
+`retrieval_mode=image_only` returns normalized `FeatureHead(f_v_raw)` without
+the text branch. `retrieval_mode=fused` uses the inference prompt above. Fused
+validation also scores the image-only view from the same image forward and
+reports it as `image_only_mAP` / `image_only_rank_1`.
 
 ## Environment
 
@@ -77,6 +79,24 @@ Core requirements are declared in `pyproject.toml`:
 
 The first real run downloads the selected Hugging Face checkpoint, which is
 several GB for So400m.
+
+### Rented GPU Hosts (AutoDL)
+
+- Use a GPU with at least 32GB. The default Stage-2 recipe needs roughly 29GB
+  (DESIGN.md section 8), so a 24GB card runs out of memory. Lowering
+  `batch_size` is not a free fix: it also shrinks the PK triplet/SigLIP mining
+  scope.
+- PyTorch comes from the CUDA 13.2 wheel index in `pyproject.toml` (already a
+  mainland mirror); `nvidia-smi` must report a driver that supports CUDA 13.x.
+- Reach Hugging Face through a mirror and keep the multi-GB model cache, the
+  dataset, and checkpoints on the data disk rather than the system disk:
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+export HF_HOME=/root/autodl-tmp/hf-cache
+mkdir -p /root/autodl-tmp/data && ln -s /root/autodl-tmp/data data   # holds data/prcc
+uv run train checkpoint_dir=/root/autodl-tmp/checkpoints/prcc-tune
+```
 
 ## Data
 
@@ -129,11 +149,23 @@ PRCC model selection never reads the test split. By default
 `validation_holdout_ids=20` holds 20 whole training identities out of the
 training split (a fixed seed, so every run shares them) and validates on them
 with the same A-gallery / C-query / B-query protocol; `best.pth` tracks that
-holdout `mAP`. After choosing hyperparameters and the epoch count on the
-holdout, train once on all 150 identities and evaluate the test split only at
-the final epoch. Pass the chosen Stage-2 epoch count to both `epochs` and
-`validation_interval`, and a separate `checkpoint_dir` so the tuning run's
-checkpoints are not overwritten:
+holdout `mAP`.
+
+The holdout has 20 identities and a small gallery (718 images), so its absolute
+mAP runs higher than on test and differences of about one point are within
+noise. Confirm a decision that hinges on a small gap by repeating both arms with
+another `validation_holdout_seed` (a different set of held-out identities).
+
+Choose the Stage-2 epoch count by comparing the **final-epoch** holdout mAP of
+separate runs (`epochs=40`, `60`, `80`, ...), not by reading the epoch of
+`best.pth` inside one run: the cosine schedule is stretched over `epochs`, so
+epoch 40 of a 60-epoch run has not annealed the way the last epoch of a 40-epoch
+run has.
+
+After choosing hyperparameters and the epoch count on the holdout, train once
+on all 150 identities and evaluate the test split only at the final epoch. Pass
+the chosen Stage-2 epoch count to both `epochs` and `validation_interval`, and a
+separate `checkpoint_dir` so the tuning run's checkpoints are not overwritten:
 
 ```bash
 uv run train \
@@ -147,6 +179,27 @@ uv run train \
 With `validation_holdout_ids=0`, PRCC rejects any `validation_interval` below
 `epochs`: the only validation is the final epoch, so the reported test metrics
 are never selected on test labels.
+
+### First PRCC Calibration Run
+
+The defaults were calibrated on MSMT17. Read these from the first holdout run
+before tuning anything else:
+
+- **Fused vs image-only.** Every PRCC gallery image is camera A and every
+  primary query is camera C, so the camera text adds one identity-agnostic
+  offset per side instead of correcting per-gallery-camera bias as on MSMT17.
+  Compare `mAP` with `image_only_mAP`. If image-only is at least as good, train
+  with `retrieval_mode=image_only freeze_prompt_bank_stage2=true`: the camera
+  text is then encoded once and cached instead of back-propagating through the
+  text tower every Stage-2 step, and the reported result no longer relies on
+  the camera C = changed-clothes metadata.
+- **Triplet margin.** `triplet_active_fraction` is the share of anchors whose
+  euclidean batch-hard hinge is still positive. If it stays near zero, the
+  `0.3` margin is inert at the `visual_raw` scale; switch to
+  `triplet_metric=cosine`.
+- **Alignment weight.** PRCC trains 130 (holdout) or 150 identities instead of
+  1041, so compare `alignment_loss` with `reid_loss` + `triplet_loss` and
+  retune `alignment_weight` if alignment dominates.
 
 Only specify values that differ from the baseline recipe. For example:
 
@@ -314,6 +367,7 @@ Run and data defaults:
 - `data_root=data/prcc`
 - `validation_holdout_ids=20` (PRCC only; `0` trains on every identity and
   validates on the test split, which requires `validation_interval >= epochs`)
+- `validation_holdout_seed=0` (which identities the holdout draws)
 - `stage1_epochs=60`
 - `epochs=60` (Stage-2 epochs)
 - `validation_interval=5`
@@ -427,11 +481,13 @@ uv run train \
 Training metrics include:
 
 - Stage-1: `loss`, `alignment_loss`, `lr`
-- Stage-2: `loss`, `alignment_loss`, `reid_loss`, `triplet_loss`, `tfc_loss`,
-  `tfc_local_loss`, `tfc_global_loss`, `tfc_cross_modal_loss`,
-  `tfc_cross_camera_loss`, `tfc_transfer_reg_loss`,
+- Stage-2: `loss`, `alignment_loss`, `reid_loss`, `triplet_loss`,
+  `triplet_active_fraction`, `tfc_loss`, `tfc_local_loss`, `tfc_global_loss`,
+  `tfc_cross_modal_loss`, `tfc_cross_camera_loss`, `tfc_transfer_reg_loss`,
   `tfc_cross_camera_coverage`, `lr`
-- Validation: `mAP`, `best_mAP`, `rank_1`, `rank_5`, `rank_10`
+- Validation: `mAP`, `best_mAP`, `rank_1`, `rank_5`, `rank_10`; fused mode adds
+  `image_only_mAP` / `image_only_rank_1`; PRCC adds `same_clothes_mAP` /
+  `same_clothes_rank_1` at the final Stage-2 epoch
 
 `stage1_train_step` and `stage2_train_step` count successful optimizer update
 windows, not micro-batches. Window metrics are means across their constituent

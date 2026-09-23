@@ -51,11 +51,19 @@ class T2CReIDModel(torch.nn.Module):
     ) -> torch.Tensor:
         """Inference / validation retrieval feature."""
         mode = require_retrieval_mode(retrieval_mode)
-        bn_features = self.feature_head(self.encode_visual_raw(images, camera_ids))
         if mode == IMAGE_ONLY_RETRIEVAL:
-            return l2_normalize(bn_features)
+            return l2_normalize(self.feature_head(self.encode_visual_raw(images, camera_ids)))
+        return self.encode_retrieval_views(images, camera_ids)[1]
+
+    def encode_retrieval_views(
+        self,
+        images: torch.Tensor,
+        camera_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Image-only and fused retrieval features from one image forward."""
+        bn_features = self.feature_head(self.encode_visual_raw(images, camera_ids))
         text = self.encode_inference_text(camera_ids)
-        return fuse_features(bn_features, text, self.beta)
+        return l2_normalize(bn_features), fuse_features(bn_features, text, self.beta)
 
     def encode_visual_raw(self, images: torch.Tensor, camera_ids: torch.Tensor | None = None) -> torch.Tensor:
         return self.image_encoder(images, camera_ids=camera_ids)

@@ -429,12 +429,20 @@ Stage-1 cache、anchor/camera cache、训练和验证使用同一 precision cont
 A/B/C 同时是 camera ID，camera prompt 与 SIE 按标准 camera 元数据使用。训练只用
 `rgb/train`。
 
-模型选择不得读取 test 标签。`validation_holdout_ids > 0`（PRCC 默认 20）按固定种子
-从训练集整体留出身份，以同样的 A/C/B 协议验证（留出身份必须有 A 和 C 图像，B 可缺），
+模型选择不得读取 test 标签。`validation_holdout_ids > 0`（PRCC 默认 20）按
+`validation_holdout_seed`（默认 0）从训练集整体留出身份，以同样的 A/C/B 协议验证（留出身份必须有 A 和 C 图像，B 可缺），
 且完全不加载 test split；调参结束后以 `validation_holdout_ids=0` 在全部训练身份上重训，
 配置校验强制 `validation_interval >= epochs`，只在最终 epoch 评估 test。PRCC
-checkpoint metadata 记录 `validation_holdout_ids`，与 pid-camera fingerprint 一起阻止
-跨设置 resume；Market-1501/MSMT17 metadata 不含该键，保持既有 schema 3 checkpoint 可续训。
+checkpoint metadata 记录 `validation_holdout_ids`（留出时再记录 seed），与 pid-camera
+fingerprint 一起阻止跨设置 resume；Market-1501/MSMT17 metadata 不含这些键，保持既有
+schema 3 checkpoint 可续训。Stage-2 epoch 数须比较不同 `epochs` 运行的最终 epoch 留出
+mAP 来选，不能取单次运行内 `best.pth` 的 epoch：cosine 调度随 `epochs` 伸缩。
+
+`fused` 验证在同一次图像前向中同时得到 image-only 视图，额外报告 `image_only_mAP` /
+`image_only_rank_1`，主 mAP 仍由配置的 `retrieval_mode` 决定。PRCC gallery 全为
+camera A、主 query 全为 camera C，camera 文本只给两侧各加一个与身份无关的偏移，无法像
+MSMT17 那样校正不同 gallery camera 的偏差，因此 fused 相对 image-only 的收益必须由该
+指标实测确认。
 
 `flip_tta` 默认关闭。开启时对每张 query/gallery 图像额外前向一次水平镜像视图，把两个
 已归一化特征相加后重新归一化，评估成本翻倍。这相对本项目主结果表所对比的公开
@@ -491,6 +499,7 @@ loss
 alignment_loss
 reid_loss
 triplet_loss
+triplet_active_fraction
 tfc_loss
 tfc_local_loss
 tfc_global_loss
