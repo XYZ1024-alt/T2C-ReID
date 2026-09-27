@@ -33,6 +33,7 @@ class ImageTransformConfig:
     erase_prob: float = 0.0
     erase_scale: tuple[float, float] = (0.02, 0.2)
     erase_ratio: tuple[float, float] = (0.3, 3.3)
+    grayscale_prob: float = 0.0
 
     def __post_init__(self) -> None:
         _validated_image_size(self.image_size)
@@ -42,7 +43,11 @@ class ImageTransformConfig:
             raise ValueError("image normalization mean and std must be finite")
         if any(value <= 0.0 for value in self.std):
             raise ValueError("image normalization std values must be positive")
-        for value, name in ((self.flip_prob, "flip_prob"), (self.erase_prob, "erase_prob")):
+        for value, name in (
+            (self.flip_prob, "flip_prob"),
+            (self.erase_prob, "erase_prob"),
+            (self.grayscale_prob, "grayscale_prob"),
+        ):
             if not math.isfinite(value) or not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1]")
         if len(self.color_jitter) != 4:
@@ -69,6 +74,7 @@ TRAIN_CROP_PADDING = 10
 TRAIN_ERASE_PROB = 0.5
 TRAIN_ERASE_SCALE = (0.02, 0.2)
 TRAIN_ERASE_RATIO = (0.3, 3.3)
+TRAIN_GRAYSCALE_PROB = 0.0
 
 
 def _processor_normalization(image_processor: Any) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
@@ -129,6 +135,7 @@ class Siglip2TrainImageTransform:
         erase_prob: float = TRAIN_ERASE_PROB,
         erase_scale: tuple[float, float] = TRAIN_ERASE_SCALE,
         erase_ratio: tuple[float, float] = TRAIN_ERASE_RATIO,
+        grayscale_prob: float = TRAIN_GRAYSCALE_PROB,
     ):
         if crop_padding < 0:
             raise ValueError("crop_padding must be non-negative")
@@ -146,6 +153,7 @@ class Siglip2TrainImageTransform:
             erase_prob=erase_prob,
             erase_scale=erase_scale,
             erase_ratio=erase_ratio,
+            grayscale_prob=grayscale_prob,
         )
         steps: list[Any] = [
             transforms.RandomHorizontalFlip(p=flip_prob),
@@ -155,8 +163,10 @@ class Siglip2TrainImageTransform:
                 saturation=color_jitter[2],
                 hue=color_jitter[3],
             ),
-            transforms.Resize(self.image_size, interpolation=InterpolationMode.BILINEAR),
         ]
+        if grayscale_prob > 0.0:
+            steps.append(transforms.RandomGrayscale(p=grayscale_prob))
+        steps.append(transforms.Resize(self.image_size, interpolation=InterpolationMode.BILINEAR))
         if crop_padding > 0:
             steps.append(transforms.Pad(crop_padding))
             steps.append(transforms.RandomCrop(self.image_size))

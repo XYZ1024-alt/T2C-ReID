@@ -32,6 +32,13 @@ PRCC_CAMERA_IDS = {"A": 1, "B": 2, "C": 3}
 PRCC_GALLERY_CAMERA = "A"
 PRCC_SAME_CLOTHES_CAMERA = "B"
 PRCC_CROSS_CLOTHES_CAMERA = "C"
+# Outfit group per raw PRCC camera id: A and B show the same clothes, C the
+# changed clothes. Clothes-adversarial training labels are (pid, group).
+PRCC_CLOTHES_GROUPS = {
+    PRCC_CAMERA_IDS["A"]: 0,
+    PRCC_CAMERA_IDS["B"]: 0,
+    PRCC_CAMERA_IDS["C"]: 1,
+}
 PRCC_TEST_SPLIT_CAMERAS = {
     "gallery": PRCC_GALLERY_CAMERA,
     "query_same": PRCC_SAME_CLOTHES_CAMERA,

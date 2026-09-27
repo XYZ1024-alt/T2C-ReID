@@ -10,7 +10,7 @@ except ImportError as exc:
         "and the platform linker, then rebuild with `uv sync`"
     ) from exc
 
-EXPECTED_NATIVE_ABI_VERSION = 1
+EXPECTED_NATIVE_ABI_VERSION = 2
 
 
 def _validate_native_extension() -> tuple[str, int]:

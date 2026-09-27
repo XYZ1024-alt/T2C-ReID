@@ -31,6 +31,7 @@ struct TransformConfig {
     erase_prob: f32,
     erase_scale: [f32; 2],
     erase_ratio: [f32; 2],
+    grayscale_prob: f32,
 }
 
 #[derive(Debug, Error)]
@@ -66,6 +67,7 @@ enum ImagePipelineError {
     erase_prob,
     erase_scale,
     erase_ratio,
+    grayscale_prob,
     threads=1
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -84,6 +86,7 @@ pub fn load_image_batch<'py>(
     erase_prob: f32,
     erase_scale: Vec<f32>,
     erase_ratio: Vec<f32>,
+    grayscale_prob: f32,
     threads: usize,
 ) -> PyResult<Bound<'py, PyArray4<f32>>> {
     if paths.is_empty() {
@@ -103,6 +106,7 @@ pub fn load_image_batch<'py>(
         erase_prob,
         erase_scale,
         erase_ratio,
+        grayscale_prob,
     )?;
     if threads == 0 {
         return Err(PyValueError::new_err("threads must be positive"));
@@ -158,6 +162,7 @@ fn validate_config(
     erase_prob: f32,
     erase_scale: Vec<f32>,
     erase_ratio: Vec<f32>,
+    grayscale_prob: f32,
 ) -> PyResult<TransformConfig> {
     if height == 0 || width == 0 {
         return Err(PyValueError::new_err("height and width must be positive"));
@@ -178,6 +183,7 @@ fn validate_config(
     }
     require_probability(flip_prob, "flip_prob")?;
     require_probability(erase_prob, "erase_prob")?;
+    require_probability(grayscale_prob, "grayscale_prob")?;
     let color_jitter = vector4(color_jitter, "color_jitter")?;
     if color_jitter[..3]
         .iter()
@@ -220,6 +226,7 @@ fn validate_config(
         erase_prob,
         erase_scale,
         erase_ratio,
+        grayscale_prob,
     })
 }
 
@@ -306,6 +313,11 @@ fn process_image(
             image::imageops::flip_horizontal_in_place(&mut image);
         }
         apply_color_jitter(&mut image, config.color_jitter, &mut rng);
+        // Drawn only when enabled so disabled grayscale keeps the pre-existing
+        // per-image random stream bitwise unchanged.
+        if config.grayscale_prob > 0.0 && rng.random::<f32>() < config.grayscale_prob {
+            to_grayscale(&mut image);
+        }
     }
     let image = resize_rgb(image, config.width as u32, config.height as u32, path)?;
     write_normalized_chw(&image, destination, config, &mut rng);
@@ -441,6 +453,13 @@ fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> [u8; 3] {
     ]
 }
 
+fn to_grayscale(image: &mut RgbImage) {
+    for pixel in image.pixels_mut() {
+        let gray = to_u8(luminance(pixel.0));
+        pixel.0 = [gray; 3];
+    }
+}
+
 fn luminance(rgb: [u8; 3]) -> f32 {
     0.299 * rgb[0] as f32 + 0.587 * rgb[1] as f32 + 0.114 * rgb[2] as f32
 }
@@ -524,7 +543,7 @@ fn image_error_to_python(error: ImagePipelineError) -> PyErr {
 
 #[cfg(test)]
 mod tests {
-    use super::{derived_seed, hsv_to_rgb, luminance};
+    use super::{RgbImage, derived_seed, hsv_to_rgb, luminance, to_grayscale};
 
     #[test]
     fn derived_seeds_are_stable_and_distinct() {
@@ -536,5 +555,13 @@ mod tests {
     fn grayscale_hue_rotation_is_stable() {
         assert_eq!(hsv_to_rgb(0.0, 0.0, 0.5), [128, 128, 128]);
         assert_eq!(luminance([255, 255, 255]).round() as u8, 255);
+    }
+
+    #[test]
+    fn grayscale_replicates_luminance_across_channels() {
+        let mut image = RgbImage::from_raw(2, 1, vec![255, 0, 0, 10, 200, 30]).unwrap();
+        to_grayscale(&mut image);
+        assert_eq!(image.get_pixel(0, 0).0, [76, 76, 76]);
+        assert_eq!(image.get_pixel(1, 0).0, [124, 124, 124]);
     }
 }

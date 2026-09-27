@@ -37,6 +37,10 @@ directional contribution independently of feature norms. Triplet distance
 computation and hard mining run in FP32 even with BF16/FP16 autocast.
 PK sampling requires every training identity to have at least `num_instances`
 images; insufficient identities raise an error instead of being silently dropped.
+With `camera_balanced_sampling=true` each identity's `num_instances` images are
+drawn round-robin over its cameras, so every multi-camera identity contributes
+cross-camera positives to every batch (for PRCC: same-clothes A/B and
+changed-clothes C images together).
 
 Training identity prompts are never used for query/gallery retrieval:
 
@@ -388,6 +392,7 @@ Batching and memory:
 - `batch_size=64`
 - `eval_batch_size=128`
 - `num_instances=4`
+- `camera_balanced_sampling=false` (spread each identity's instances over its cameras)
 - `gradient_accumulation_steps=1`
 - `num_workers=8`
 - `data_backend=rust|python` (default `rust`; Python is a reference backend)
@@ -404,6 +409,16 @@ Optimization:
 
 - `lr=1e-4`
 - `image_encoder_lr=5e-6`
+- `image_encoder_frozen_layers=0` (freeze the vision embeddings plus the first
+  N of the 27 So400m encoder blocks whenever the image encoder trains)
+- `image_encoder_layer_decay=1.0` (layer-wise LR decay: block `i` of `L` trains
+  at `image_encoder_lr * decay^(L + 1 - i)`, the embeddings at `decay^(L + 1)`,
+  post-layernorm and pooling head at the full rate)
+- `model_ema_decay=0.0` (Stage-2 weight EMA for validation; 0 disables)
+- `clothes_adversarial_weight=0.0` (PRCC-only clothes-adversarial loss, CAL;
+  0 disables, the reference implementation uses 1.0)
+- `clothes_adversarial_start_epoch=2` (Stage-2 epoch at which the adversarial
+  term starts; the clothes discriminator trains from Stage-2 epoch 1)
 - `grad_clip_norm=5.0` (0 disables)
 - `alignment_weight=0.1`
 - `tfc_weight=1.0`
@@ -453,6 +468,29 @@ New checkpoints use schema version 3 and include:
 - tokenizer padding/pooling layout
 - resolved precision
 - model, optimizer, and FP16 scaler state
+- with `model_ema_decay > 0`, the Stage-2 EMA shadow weights
+  (`auxiliary_state["model_ema"]`); `model_state` always holds the live weights
+
+`image_encoder_frozen_layers`, `image_encoder_layer_decay`, and
+`model_ema_decay` enter the resume metadata only when set to a non-default
+value, so checkpoints written before these options existed still resume.
+`clothes_adversarial_weight` and `clothes_adversarial_start_epoch` are recorded
+only when CAL is enabled; such checkpoints also hold `clothes_classifier.weight`.
+
+With `clothes_adversarial_weight > 0` (PRCC only), a cosine clothes classifier
+(scale 16) over `(pid, outfit)` labels, where cameras A/B share an outfit and C
+is the changed outfit, trains on detached BNNeck features. The backbone
+minimizes the CAL multi-positive loss (epsilon 0.1) against the detached
+classifier weights. Stage-2 logs `clothes_loss`, `clothes_adversarial_loss`,
+and the discriminator's `clothes_accuracy`.
+
+With `model_ema_decay > 0`, the EMA starts from the weights at the first Stage-2
+epoch, is updated after every successful optimizer step, and replaces the live
+weights during validation. `mAP`, `rank_1`, `best.pth` selection, and the
+final-epoch report use the EMA weights; `raw_mAP` / `raw_rank_1` report the live
+weights of the same epoch. The update uses `decay_t = min(decay, t / (t + 1))`:
+the first `1 / (1 - decay)` updates (333 at `0.997`) are averaged uniformly and
+the initialization snapshot is dropped, after which the average is exponential.
 
 Resume a Stage-2 run with the same architecture and precision:
 
@@ -484,7 +522,8 @@ Training metrics include:
 - Stage-2: `loss`, `alignment_loss`, `reid_loss`, `triplet_loss`,
   `triplet_active_fraction`, `tfc_loss`, `tfc_local_loss`, `tfc_global_loss`,
   `tfc_cross_modal_loss`, `tfc_cross_camera_loss`, `tfc_transfer_reg_loss`,
-  `tfc_cross_camera_coverage`, `lr`
+  `tfc_cross_camera_coverage`, `clothes_loss`, `clothes_adversarial_loss`,
+  `clothes_accuracy` (all 0 unless CAL is enabled), `lr`
 - Validation: `mAP`, `best_mAP`, `rank_1`, `rank_5`, `rank_10`; fused mode adds
   `image_only_mAP` / `image_only_rank_1`; PRCC adds `same_clothes_mAP` /
   `same_clothes_rank_1` at the final Stage-2 epoch
@@ -531,8 +570,9 @@ and ordered by gallery index in both backends.
 ## Native Data Pipeline
 
 The default training loader sends path/ID records to a batch collator. Rust
-reads JPEG/PNG images, converts to RGB, applies flip, randomized ColorJitter,
-bilinear resize, padded crop, SigLIP normalization, and normalized-space random
+reads JPEG/PNG images, converts to RGB, applies flip, randomized ColorJitter
+(`color_jitter=[0.2,0.2,0.2,0.05]`, brightness/contrast/saturation/hue), optional
+random grayscale (`grayscale_prob=0.0`), bilinear resize, padded crop, SigLIP normalization, and normalized-space random
 erasing, then transfers an owned contiguous `BCHW float32` allocation to NumPy
 and `torch.from_numpy` without copying the element buffer.
 

@@ -186,6 +186,7 @@ class RustReIDBatchCollator:
                 config.erase_prob,
                 list(config.erase_scale),
                 list(config.erase_ratio),
+                config.grayscale_prob,
                 self.threads,
             )
         )
@@ -203,11 +204,20 @@ class RustReIDBatchCollator:
 
 
 class IdentityBalancedBatchSampler(torch.utils.data.Sampler[list[int]]):
+    """PK sampler: ``batch_size // K`` identities with ``K`` images each.
+
+    With ``camera_labels`` the ``K`` images of an identity are drawn round-robin
+    over its cameras in shuffled order, so every identity with images from
+    several cameras (for PRCC, several clothing states) contributes
+    cross-camera positives to each batch instead of relying on chance.
+    """
+
     def __init__(
         self,
         labels: Sequence[int],
         batch_size: int,
         instances_per_identity: int = DEFAULT_INSTANCES_PER_IDENTITY,
+        camera_labels: Sequence[int] | None = None,
     ):
         self._labels = tuple(labels)
         self._batch_size = batch_size
@@ -219,6 +229,13 @@ class IdentityBalancedBatchSampler(torch.utils.data.Sampler[list[int]]):
         _validate_identity_groups(
             self._groups, self._identities_per_batch, instances_per_identity
         )
+        if camera_labels is not None and len(camera_labels) != len(self._labels):
+            raise ValueError("camera_labels must contain one camera per sample label")
+        self._camera_groups = (
+            None
+            if camera_labels is None
+            else _identity_camera_groups(self._groups, tuple(camera_labels))
+        )
 
     def __iter__(self):
         for _ in range(len(self)):
@@ -229,13 +246,14 @@ class IdentityBalancedBatchSampler(torch.utils.data.Sampler[list[int]]):
 
     def _sample_batch(self) -> list[int]:
         labels = random.sample(tuple(self._groups), self._identities_per_batch)
-        return [
-            index
-            for label in labels
-            for index in random.sample(
-                self._groups[label], self._instances_per_identity
-            )
-        ]
+        return [index for label in labels for index in self._sample_instances(label)]
+
+    def _sample_instances(self, label: int) -> list[int]:
+        if self._camera_groups is None:
+            return random.sample(self._groups[label], self._instances_per_identity)
+        return _camera_round_robin(
+            self._camera_groups[label], self._instances_per_identity
+        )
 
 
 def build_person_id_map(samples: Sequence[ReIDSample]) -> dict[int, int]:
@@ -291,6 +309,29 @@ def _eligible_identity_groups(
             f"insufficient identity counts: {insufficient}"
         )
     return groups
+
+
+def _identity_camera_groups(
+    groups: Mapping[int, list[int]], camera_labels: Sequence[int]
+) -> dict[int, list[list[int]]]:
+    camera_groups: dict[int, list[list[int]]] = {}
+    for label, indices in groups.items():
+        by_camera: dict[int, list[int]] = {}
+        for index in indices:
+            by_camera.setdefault(camera_labels[index], []).append(index)
+        camera_groups[label] = [by_camera[camera] for camera in sorted(by_camera)]
+    return camera_groups
+
+
+def _camera_round_robin(cameras: Sequence[list[int]], count: int) -> list[int]:
+    pools = [random.sample(indices, len(indices)) for indices in cameras]
+    random.shuffle(pools)
+    selected: list[int] = []
+    while len(selected) < count:
+        pools = [pool for pool in pools if pool]
+        for pool in pools[: count - len(selected)]:
+            selected.append(pool.pop())
+    return selected
 
 
 def _validate_identity_groups(

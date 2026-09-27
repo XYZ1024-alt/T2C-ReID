@@ -28,6 +28,9 @@ f       = normalize(f_v + beta * f_t)
 融合前图像与文本均做 L2 归一化，`beta` 不随特征范数变化。Triplet 的距离计算与
 困难样本选择必须禁用 autocast 并使用 FP32。PK 采样初始化时检查每个训练身份
 至少有 `num_instances` 张图片，不足时明确报错，不允许静默丢弃身份。
+`camera_balanced_sampling=true` 时，每个身份的 K 张图按打乱后的摄像头顺序轮流抽取
+（摄像头内无放回，耗尽后由其余摄像头补足），保证多摄像头身份在每个 micro-batch 内都
+提供跨摄像头正样本；对 PRCC 即同时包含 A/B 同衣与 C 换衣图像。默认关闭。
 
 推理只允许身份无关 prompt：
 
@@ -118,7 +121,9 @@ checkpoint 都在下载前失败。
 训练增强保留：
 
 - horizontal flip；
-- color jitter；
+- color jitter（`color_jitter` 可配置，默认 `(0.2, 0.2, 0.2, 0.05)`）；
+- color jitter 之后按 `grayscale_prob` 概率转灰度（默认 `0.0` 关闭；Rust 仅在启用时
+  消耗随机数，关闭时逐图随机序列与旧版本一致）；
 - resize 后 pad + random crop；
 - normalization 后 random erasing。
 
@@ -269,6 +274,29 @@ L_total = L_id
 - `L_TFC`：camera-aware visual/text 双中心约束，定义见 6.3。
 - `label_smoothing` 只作用于 `L_id`。
 
+### 6.2.1 可选：PRCC 换衣对抗损失（CAL）
+
+`clothes_adversarial_weight > 0` 时启用 Gu et al. CVPR 2022 的 clothes-based adversarial
+loss，仅支持 `dataset=prcc`，其他数据集在配置校验阶段失败。衣服标签取
+`(pid, 衣服组)`：camera A、B 为同一套衣服（组 0），C 为换衣（组 1），只为训练集中实际出现的
+组合编号。
+
+```text
+logit_c = 16 * cosine(bn, w_c)
+L_clothes = CE(logit_c(bn.detach()), clothes_id)                       # 只训练判别器
+log p_c   = logit_c - log(exp(logit_c) + sum_{j in S-} exp(logit_j))     # w.detach()
+q_c       = 0.9 * [c == clothes_id] + 0.1 / |S+| * [c in S+]
+L_CAL     = -sum_c q_c * log p_c                                         # 只训练 backbone
+L_total  += L_clothes + clothes_adversarial_weight * L_CAL
+```
+
+`S+` 为同一身份的全部衣服类，`S-` 为其他身份的衣服类，所以分母不含同身份的其他衣服，
+backbone 不会因为分开同一个人的不同衣服而得到奖励。两条梯度路径不相交：一次 backward 等价
+于官方实现的判别器/主干两个 optimizer。判别器从 Stage-2 第 1 个 epoch 起训练；对抗项从
+Stage-2 局部 epoch `clothes_adversarial_start_epoch`（默认 2）起才计入，此前权重为 0。
+判别器权重进入 `new` 参数组，不参与 `grad_clip_norm` 的全局范数；衣服标签查表由训练集
+派生，不写入 state dict。logit 在 autocast 之外以 FP32 计算。
+
 ### 6.3 Camera-aware Cross-modal TFC
 
 训练 split 启动时统计 `count[y]` 与 `count[y,c]`。TFC 在 FP32 buffer 中维护：
@@ -351,9 +379,17 @@ camera retrieval text：
 - prompt bank 和 text tower 都冻结：每个 camera 只编码一次。
 - 否则在线编码。
 
+视觉塔训练时，`image_encoder_frozen_layers = N > 0` 额外冻结 patch/position embedding
+与前 N 个 encoder block（So400m 共 27 个），SIE 仍跟随视觉塔冻结状态。默认 0 训练整座
+视觉塔。
+
 AdamW 参数分组：
 
-- `vision_model.*` 使用 `image_encoder_lr`。
+- `vision_model.*` 使用 `image_encoder_lr`。`image_encoder_layer_decay = d < 1` 时启用
+  layer-wise LR decay：embedding 层号 0、第 i 个 block 层号 i + 1、post-layernorm 与
+  pooling head 层号 L + 1，层号 k 的学习率为 `image_encoder_lr * d^(L + 1 - k)`，每个层号
+  独立成组，且按层号降序排列，保证 `param_groups[0]`（W&B `lr`）是未衰减的
+  `image_encoder_lr`。`d = 1` 时分组与未启用时完全相同。
 - prompt、classifier、TFC transfer logits、BNNeck、可训练文本塔使用 `lr`。
 - 一维参数、bias、prompt、SIE 和 TFC transfer logits 不做 weight decay。
 - 其他矩阵参数使用 `1e-4` weight decay。
@@ -404,6 +440,16 @@ auto + CPU               -> fp32
 4. epoch 尾部不足 4 个 micro-batch 时按实际长度归一化。
 5. FP16 overflow 跳过的窗口不计为 W&B optimizer update step，并回滚该窗口触及的
    TFC local/global center 与 initialized mask。
+
+`model_ema_decay > 0` 时维护 Stage-2 权重 EMA：在首个 Stage-2 训练 epoch、Stage-2 冻结
+之后，对 retrieval model 当时可训练的参数和全部浮点 buffer（BNNeck running stats）建立
+影子副本；每个成功的 optimizer window 之后执行
+`shadow <- decay_t * shadow + (1 - decay_t) * live`，其中 `decay_t = min(decay, t / (t + 1))`、
+t 为已完成的更新次数；前 `1 / (1 - decay)` 次更新等价于均匀平均并丢弃初始化快照（包括
+BNNeck 未训练的默认统计量），之后才是指数平均。FP16 跳过的窗口不更新。分类器和 TFC bank
+不参与检索，因此不纳入 EMA。验证时换入 EMA 权重提取特征，结束后恢复训练权重；主 `mAP`、
+`best.pth` 选择与最终 epoch 报告都基于 EMA 权重，同时额外报告训练权重的 `raw_mAP` /
+`raw_rank_1`。
 
 Stage-1 cache、anchor/camera cache、训练和验证使用同一 precision controller。落到 CPU
 进行 ReID 距离计算的最终 feature 强制转换为 FP32。
@@ -477,7 +523,14 @@ reference 与 Rust 使用同一规则。该实现将常驻内存从稠密 `O(N^2
   buffer 与 camera transfer logits；
 - model 和 optimizer state；
 - FP16 GradScaler auxiliary state；
+- 启用 EMA 时 auxiliary state 的 `model_ema`（decay、update 计数与影子权重）；
+  `model_state` 始终是训练权重；
 - epoch、stage、best mAP 和验证指标。
+
+`image_encoder_frozen_layers`、`image_encoder_layer_decay`、`model_ema_decay` 仅在取非默认值
+时写入 resume metadata：它们改变 optimizer 分组与 auxiliary state，而默认值保持旧 checkpoint
+可续训。`clothes_adversarial_weight > 0` 时同时写入它和 `clothes_adversarial_start_epoch`，
+model state 额外包含 `clothes_classifier.weight`。EMA 开关与 checkpoint 中是否存在 `model_ema` 不一致时明确失败。
 
 resume 必须先验证 metadata，再加载 model state。旧 checkpoint 缺少 SigLIP 2 schema，
 或 model/image/feature/precision 字段不一致时明确失败。旧 OpenAI CLIP state dict 不做转换。
@@ -507,8 +560,14 @@ tfc_cross_modal_loss
 tfc_cross_camera_loss
 tfc_transfer_reg_loss
 tfc_cross_camera_coverage
+clothes_loss
+clothes_adversarial_loss
+clothes_accuracy
 lr
 ```
+
+未启用 CAL 时三个 `clothes_*` 指标恒为 0；启用时 `loss` 包含只作用于判别器的
+`clothes_loss`，`clothes_accuracy` 为判别器在当前 batch 上的衣服分类准确率。
 
 `stage*_train_step` 统计成功的 optimizer update window。step 指标为窗口内 micro-batch
 均值；epoch 指标为所有 micro-batch 的均值。metadata 必须记录 requested/resolved
