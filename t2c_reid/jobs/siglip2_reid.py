@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import hashlib
 import math
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from itertools import batched
 from pathlib import Path
@@ -24,8 +25,14 @@ from torch.utils.data import DataLoader
 
 from scripts.train import StageMetadata, TrainingJob, TwoStageTrainingJob
 from t2c_reid.anchors import IdentityAnchorProvider
+from t2c_reid.clothes import (
+    ClothesAdversarialSchedule,
+    ClothesClassifier,
+    build_clothes_table,
+)
 from t2c_reid.configuration import HOLDOUT_DATASETS, TrainingConfig
 from t2c_reid.data import (
+    PRCC_CLOTHES_GROUPS,
     PRCC_HOLDOUT_SEED,
     ReIDSample,
     load_market_split,
@@ -48,6 +55,7 @@ from t2c_reid.datasets import (
     collate_reid_batches,
     require_data_backend,
 )
+from t2c_reid.ema import ModelEma
 from t2c_reid.evaluation import (
     ReIDMetrics,
     evaluate_reid,
@@ -83,6 +91,8 @@ from t2c_reid.training import (
     stage2_loss_breakdown,
 )
 from t2c_reid.transforms import (
+    TRAIN_COLOR_JITTER,
+    TRAIN_GRAYSCALE_PROB,
     ImageTransformConfig,
     Siglip2ImageTransform,
     Siglip2TrainImageTransform,
@@ -92,6 +102,7 @@ DEFAULT_RANKS = (1, 5, 10)
 # Extra PRCC query set evaluated against the same gallery; the primary
 # query/mAP is cross-clothes (camera C).
 SAME_CLOTHES_QUERY = "same_clothes"
+MODEL_EMA_STATE_KEY = "model_ema"
 PROMPT_TEMPLATE_PREFIX = "a photo of a"
 PROMPT_TEMPLATE_SUFFIX = "person ."
 STAGE1_TRAIN_LOSS_METRIC_NAMES = ("loss", "alignment_loss")
@@ -108,6 +119,9 @@ STAGE2_TRAIN_LOSS_METRIC_NAMES = (
     "tfc_cross_camera_loss",
     "tfc_transfer_reg_loss",
     "tfc_cross_camera_coverage",
+    "clothes_loss",
+    "clothes_adversarial_loss",
+    "clothes_accuracy",
 )
 STAGE1 = "stage1"
 STAGE2 = "stage2"
@@ -203,12 +217,20 @@ class Siglip2ReIDJobConfig:
     stage2_lr_scheduler: str = "none"
     stage2_warmup_epochs: int = 0
     num_instances: int = DEFAULT_INSTANCES_PER_IDENTITY
+    camera_balanced_sampling: bool = False
+    color_jitter: tuple[float, float, float, float] = TRAIN_COLOR_JITTER
+    grayscale_prob: float = TRAIN_GRAYSCALE_PROB
     sie_coe: float = 0.0
     stage1_feature_cache: bool = True
     grad_clip_norm: float = 0.0
     flip_tta: bool = False
     validation_holdout_ids: int = 0
     validation_holdout_seed: int = PRCC_HOLDOUT_SEED
+    image_encoder_frozen_layers: int = 0
+    image_encoder_layer_decay: float = 1.0
+    model_ema_decay: float = 0.0
+    clothes_adversarial_weight: float = 0.0
+    clothes_adversarial_start_epoch: int = 2
 
 
 @dataclass(frozen=True)
@@ -226,6 +248,8 @@ class DatasetBundle:
     # Named secondary query sets scored against ``gallery`` and reported as
     # metric extras; the primary ``query`` alone drives mAP and model selection.
     extra_queries: tuple[tuple[str, ReIDImageDataset | ReIDMetadataDataset], ...] = ()
+    # Raw dataset camera id of each dense camera index.
+    camera_raw_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -324,6 +348,11 @@ class Stage1FeatureCache:
             self._person_ids.tolist(),
             batch_size=self._config.batch_size,
             instances_per_identity=self._config.num_instances,
+            camera_labels=(
+                self._camera_ids.tolist()
+                if self._config.camera_balanced_sampling
+                else None
+            ),
         )
         for batch_indices in sampler:
             indices = torch.tensor(
@@ -352,6 +381,8 @@ class StageTrainingRuntime:
     precision: PrecisionController | None = None
     gradient_accumulation_steps: int = 1
     grad_clip_norm: float = 0.0
+    model_ema: ModelEma | None = None
+    clothes_schedule: ClothesAdversarialSchedule | None = None
 
 
 @dataclass(frozen=True)
@@ -364,6 +395,38 @@ class ValidationRuntime:
     beta_schedule: BetaSchedule | None = None
     report_rerank: bool = False
     precision: PrecisionController | None = None
+    model_ema: ModelEma | None = None
+
+
+@dataclass(frozen=True)
+class Stage2AuxiliaryState:
+    """Stage-2 checkpoint side state: precision/scaler plus the optional weight EMA.
+
+    ``model_state`` always holds the live training weights; the EMA shadow is
+    stored under ``model_ema`` so a resumed run continues the same average.
+    """
+
+    precision: PrecisionController
+    model_ema: ModelEma | None = None
+
+    def state_dict(self) -> dict[str, Any]:
+        state = self.precision.state_dict()
+        if self.model_ema is not None:
+            state[MODEL_EMA_STATE_KEY] = self.model_ema.state_dict()
+        return state
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        ema_state = state.get(MODEL_EMA_STATE_KEY)
+        if (ema_state is None) != (self.model_ema is None):
+            raise ValueError(
+                "checkpoint model EMA state does not match this run's "
+                "model_ema_decay setting"
+            )
+        self.precision.load_state_dict(dict(state))
+        if self.model_ema is not None:
+            if not isinstance(ema_state, Mapping):
+                raise TypeError("checkpoint model EMA state must be a mapping")
+            self.model_ema.load_state_dict(ema_state)
 
 
 @dataclass(frozen=True)
@@ -436,11 +499,13 @@ class Siglip2ReIDTrainingModel(torch.nn.Module):
         retrieval_model: T2CReIDModel,
         classifier: torch.nn.Module,
         tfc_bank: CameraAwareTFCBank,
+        clothes_classifier: ClothesClassifier | None = None,
     ):
         super().__init__()
         self.retrieval_model = retrieval_model
         self.classifier = classifier
         self.tfc_bank = tfc_bank
+        self.clothes_classifier = clothes_classifier
 
     def encode_retrieval(
         self,
@@ -496,7 +561,10 @@ def build_training_job(
     )
     transforms = TransformBundle(
         train=Siglip2TrainImageTransform(
-            loaded_siglip2.image_processor, image_size=config.image_size
+            loaded_siglip2.image_processor,
+            image_size=config.image_size,
+            color_jitter=config.color_jitter,
+            grayscale_prob=config.grayscale_prob,
         ),
         eval=Siglip2ImageTransform(
             loaded_siglip2.image_processor, image_size=config.image_size
@@ -525,6 +593,13 @@ def build_training_job(
         ),
     ).to(config.device)
     precision = PrecisionController(config.precision)
+    # Averages the Stage-2 retrieval path only; the classifier and TFC bank
+    # never take part in evaluation.
+    model_ema = (
+        ModelEma(shared_model.retrieval_model, config.model_ema_decay)
+        if config.model_ema_decay > 0.0
+        else None
+    )
     loaders = _build_loaders(data, config)
     (
         stage1_runtime,
@@ -539,6 +614,7 @@ def build_training_job(
         data.num_train_ids,
         precision=precision,
         stage1_feature_cache=_build_stage1_feature_cache(config, data),
+        model_ema=model_ema,
     )
     metadata = _stage_metadata(config, spec, data)
     stage2_job = TrainingJob(
@@ -555,11 +631,12 @@ def build_training_job(
                 beta_schedule=stage2_beta_schedule,
                 report_rerank=config.report_rerank,
                 precision=precision,
+                model_ema=model_ema,
             )
         ),
         stage_metadata=metadata,
         checkpoint_metadata=_checkpoint_metadata(config, spec, data),
-        auxiliary_state=precision,
+        auxiliary_state=Stage2AuxiliaryState(precision, model_ema),
     )
     if config.stage1_epochs <= 0:
         return stage2_job
@@ -822,6 +899,7 @@ def load_dataset_bundle(
             )
             for name, samples in splits.extra_queries
         ),
+        camera_raw_ids=tuple(sorted(camera_map, key=camera_map.__getitem__)),
     )
 
 
@@ -908,11 +986,27 @@ def _job_config_from_training_config(config: TrainingConfig) -> Siglip2ReIDJobCo
     if config.num_workers == 0 and persistent_workers_arg is True:
         raise ValueError("persistent_workers=true requires num_workers to be positive")
     precision = resolve_precision(config.precision, device)
+    color_jitter = _validated_color_augmentation(
+        config.color_jitter, config.grayscale_prob
+    )
     if config.siglip2_model_name != SIGLIP2_MODEL_ID:
         raise ValueError(
             f"this training job only supports {SIGLIP2_MODEL_ID!r}, got "
             f"{config.siglip2_model_name!r}"
         )
+    if config.image_encoder_frozen_layers < 0:
+        raise ValueError("image_encoder_frozen_layers must be non-negative")
+    if (
+        not math.isfinite(config.image_encoder_layer_decay)
+        or not 0.0 < config.image_encoder_layer_decay <= 1.0
+    ):
+        raise ValueError("image_encoder_layer_decay must satisfy 0 < decay <= 1")
+    if (
+        not math.isfinite(config.model_ema_decay)
+        or not 0.0 <= config.model_ema_decay < 1.0
+    ):
+        raise ValueError("model_ema_decay must satisfy 0 <= decay < 1 (0 disables)")
+    _validate_clothes_adversarial_config(config)
     _validate_tfc_config(
         tfc_weight=config.tfc_weight,
         head_momentum=config.tfc_momentum,
@@ -981,13 +1075,51 @@ def _job_config_from_training_config(config: TrainingConfig) -> Siglip2ReIDJobCo
         stage2_lr_scheduler=config.stage2_lr_scheduler,
         stage2_warmup_epochs=config.stage2_warmup_epochs,
         num_instances=config.num_instances,
+        camera_balanced_sampling=config.camera_balanced_sampling,
+        color_jitter=color_jitter,
+        grayscale_prob=config.grayscale_prob,
         sie_coe=config.sie_coe,
         stage1_feature_cache=config.stage1_feature_cache,
         grad_clip_norm=_validated_grad_clip_norm(config.grad_clip_norm),
         flip_tta=config.flip_tta,
         validation_holdout_ids=config.validation_holdout_ids,
         validation_holdout_seed=config.validation_holdout_seed,
+        image_encoder_frozen_layers=config.image_encoder_frozen_layers,
+        image_encoder_layer_decay=config.image_encoder_layer_decay,
+        model_ema_decay=config.model_ema_decay,
+        clothes_adversarial_weight=config.clothes_adversarial_weight,
+        clothes_adversarial_start_epoch=config.clothes_adversarial_start_epoch,
     )
+
+
+def _validate_clothes_adversarial_config(config: TrainingConfig) -> None:
+    weight = config.clothes_adversarial_weight
+    if not math.isfinite(weight) or weight < 0.0:
+        raise ValueError("clothes_adversarial_weight must be finite and non-negative")
+    if config.clothes_adversarial_start_epoch < 1:
+        raise ValueError("clothes_adversarial_start_epoch must be positive")
+    if weight > 0.0 and config.dataset != "prcc":
+        raise ValueError(
+            "clothes_adversarial_weight > 0 requires dataset=prcc: clothes "
+            "labels are derived from the PRCC camera outfit groups"
+        )
+
+
+def _validated_color_augmentation(
+    color_jitter: Sequence[float], grayscale_prob: float
+) -> tuple[float, float, float, float]:
+    # Fail before the multi-gigabyte model load; the transform config owns the
+    # actual range rules.
+    values = tuple(float(value) for value in color_jitter)
+    ImageTransformConfig(
+        image_size=(1, 1),
+        mean=(0.0, 0.0, 0.0),
+        std=(1.0, 1.0, 1.0),
+        training=True,
+        color_jitter=values,
+        grayscale_prob=grayscale_prob,
+    )
+    return values
 
 
 def _validated_grad_clip_norm(value: float) -> float:
@@ -1042,6 +1174,7 @@ def _build_runtimes(
     num_train_ids: int,
     precision: PrecisionController,
     stage1_feature_cache: Stage1FeatureCache | None,
+    model_ema: ModelEma | None = None,
 ) -> tuple[
     StageTrainingRuntime,
     StageTrainingRuntime,
@@ -1095,6 +1228,16 @@ def _build_runtimes(
         precision=precision,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         grad_clip_norm=config.grad_clip_norm,
+        model_ema=model_ema,
+        clothes_schedule=(
+            ClothesAdversarialSchedule(
+                weight=config.clothes_adversarial_weight,
+                start_epoch=config.clothes_adversarial_start_epoch,
+                first_epoch=config.stage2_first_epoch,
+            )
+            if model.clothes_classifier is not None
+            else None
+        ),
     )
     return (
         stage1_runtime,
@@ -1122,6 +1265,10 @@ def _apply_freezing(
     image_trainable = _image_encoder_trainable(config, stage)
     text_trainable = not config.freeze_text_encoder
     _set_module_requires_grad(siglip2_model.vision_model, image_trainable)
+    if image_trainable and config.image_encoder_frozen_layers > 0:
+        _freeze_lower_vision_layers(
+            siglip2_model.vision_model, config.image_encoder_frozen_layers
+        )
     # The SIE camera embedding feeds the vision tower, so it follows the
     # image-encoder freeze state of the current stage.
     if retrieval.image_encoder.sie_embedding is not None:
@@ -1139,9 +1286,35 @@ def _apply_freezing(
         retrieval.set_inference_text_cache(None)
     model.classifier.requires_grad_(stage == STAGE2)
     model.tfc_bank.requires_grad_(stage == STAGE2)
+    if model.clothes_classifier is not None:
+        model.clothes_classifier.requires_grad_(stage == STAGE2)
     retrieval.feature_head.requires_grad_(stage == STAGE2)
     if isinstance(retrieval.feature_head, BNNeck):
         retrieval.feature_head.freeze_bias()
+
+
+def _freeze_lower_vision_layers(vision_model: torch.nn.Module, count: int) -> None:
+    # The patch/position embeddings sit below block 0, so freezing any block
+    # freezes them too.
+    layers = _vision_encoder_layers(vision_model)
+    if count > len(layers):
+        raise ValueError(
+            f"image_encoder_frozen_layers={count} exceeds the {len(layers)} "
+            "vision encoder layers"
+        )
+    _set_module_requires_grad(vision_model.embeddings, False)
+    for layer in layers[:count]:
+        _set_module_requires_grad(layer, False)
+
+
+def _vision_encoder_layers(vision_model: torch.nn.Module) -> torch.nn.ModuleList:
+    layers = getattr(getattr(vision_model, "encoder", None), "layers", None)
+    if not isinstance(layers, torch.nn.ModuleList):
+        raise TypeError(
+            "partial vision freezing and layer-wise LR decay require "
+            "vision_model.encoder.layers"
+        )
+    return layers
 
 
 def _image_encoder_trainable(config: Siglip2ReIDJobConfig, stage: str) -> bool:
@@ -1182,36 +1355,74 @@ NO_DECAY_PARAMETER_PREFIXES = (
 
 
 def _build_optimizer(
-    model: torch.nn.Module, config: Siglip2ReIDJobConfig
+    model: Siglip2ReIDTrainingModel, config: Siglip2ReIDJobConfig
 ) -> torch.optim.Optimizer:
-    grouped: dict[tuple[str, bool], list[torch.nn.Parameter]] = {}
+    # With layer-wise decay each vision layer id gets its own groups; layer
+    # None keeps the single backbone family used when the decay is 1.
+    layer_decay = config.image_encoder_layer_decay
+    num_layers = (
+        len(
+            _vision_encoder_layers(
+                _siglip2_model_for(model.retrieval_model).vision_model
+            )
+        )
+        if layer_decay < 1.0
+        else 0
+    )
+    grouped: dict[tuple[str, int | None, bool], list[torch.nn.Parameter]] = {}
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        family = "backbone" if name.startswith(BACKBONE_PARAMETER_PREFIXES) else "new"
+        backbone = name.startswith(BACKBONE_PARAMETER_PREFIXES)
+        family = "backbone" if backbone else "new"
+        layer_id = (
+            _vision_layer_id(name, num_layers) if backbone and layer_decay < 1.0 else None
+        )
         no_decay = parameter.ndim <= 1 or name.startswith(NO_DECAY_PARAMETER_PREFIXES)
-        grouped.setdefault((family, no_decay), []).append(parameter)
+        grouped.setdefault((family, layer_id, no_decay), []).append(parameter)
     if not grouped:
         raise ValueError(
             "no trainable parameters were found for the requested stage; "
             "enable at least one of the prompt_bank/classifier/text_encoder"
         )
     family_lrs = {"backbone": config.image_encoder_lr, "new": config.lr}
+    # Deepest vision layer first, so param_groups[0] (the reported lr) keeps
+    # the undecayed image_encoder_lr.
+    ordered = sorted(
+        grouped,
+        key=lambda key: (
+            key[0] != "backbone",
+            -(key[1] if key[1] is not None else 0),
+            key[2],
+        ),
+    )
     param_groups: list[dict[str, Any]] = []
-    for family in ("backbone", "new"):
-        for no_decay in (False, True):
-            params = grouped.get((family, no_decay))
-            if not params:
-                continue
-            param_groups.append(
-                {
-                    "params": params,
-                    "lr": family_lrs[family],
-                    "weight_decay": 0.0 if no_decay else WEIGHT_DECAY,
-                    "name": f"{family}_no_decay" if no_decay else family,
-                }
-            )
+    for family, layer_id, no_decay in ordered:
+        lr = family_lrs[family]
+        name = family
+        if layer_id is not None:
+            lr *= layer_decay ** (num_layers + 1 - layer_id)
+            name = f"{family}_layer{layer_id}"
+        param_groups.append(
+            {
+                "params": grouped[(family, layer_id, no_decay)],
+                "lr": lr,
+                "weight_decay": 0.0 if no_decay else WEIGHT_DECAY,
+                "name": f"{name}_no_decay" if no_decay else name,
+            }
+        )
     return torch.optim.AdamW(param_groups)
+
+
+def _vision_layer_id(name: str, num_layers: int) -> int:
+    """0 for the embeddings, i + 1 for encoder block i, L + 1 for the head."""
+
+    local = name.removeprefix(BACKBONE_PARAMETER_PREFIXES[0])
+    if local.startswith("embeddings."):
+        return 0
+    if local.startswith("encoder.layers."):
+        return int(local.split(".")[2]) + 1
+    return num_layers + 1
 
 
 def _pretrained_siglip_calibration(
@@ -1357,6 +1568,11 @@ def _stage_metadata(
             "evaluation_chunk_size": config.evaluation_chunk_size,
             "lr": config.lr,
             "image_encoder_lr": config.image_encoder_lr,
+            "image_encoder_frozen_layers": config.image_encoder_frozen_layers,
+            "image_encoder_layer_decay": config.image_encoder_layer_decay,
+            "model_ema_decay": config.model_ema_decay,
+            "clothes_adversarial_weight": config.clothes_adversarial_weight,
+            "clothes_adversarial_start_epoch": config.clothes_adversarial_start_epoch,
             "beta": config.beta,
             "beta_warmup_epochs": config.beta_warmup_epochs,
             "alignment_weight": config.alignment_weight,
@@ -1391,6 +1607,9 @@ def _stage_metadata(
             "stage2_lr_scheduler": config.stage2_lr_scheduler,
             "stage2_warmup_epochs": config.stage2_warmup_epochs,
             "num_instances": config.num_instances,
+            "camera_balanced_sampling": config.camera_balanced_sampling,
+            "color_jitter": list(config.color_jitter),
+            "grayscale_prob": config.grayscale_prob,
             "sie_coe": config.sie_coe,
             "stage1_feature_cache": config.stage1_feature_cache,
             "feature_dim": spec.feature_dim,
@@ -1420,6 +1639,19 @@ def _checkpoint_metadata(
         metadata["validation_holdout_ids"] = config.validation_holdout_ids
         if config.validation_holdout_ids:
             metadata["validation_holdout_seed"] = config.validation_holdout_seed
+    # Recorded only when enabled, so checkpoints from before these options
+    # still resume. They change the optimizer groups and the auxiliary state.
+    if config.image_encoder_frozen_layers:
+        metadata["image_encoder_frozen_layers"] = config.image_encoder_frozen_layers
+    if config.image_encoder_layer_decay != 1.0:
+        metadata["image_encoder_layer_decay"] = config.image_encoder_layer_decay
+    if config.model_ema_decay:
+        metadata["model_ema_decay"] = config.model_ema_decay
+    if config.clothes_adversarial_weight:
+        metadata["clothes_adversarial_weight"] = config.clothes_adversarial_weight
+        metadata["clothes_adversarial_start_epoch"] = (
+            config.clothes_adversarial_start_epoch
+        )
     return metadata
 
 
@@ -1592,7 +1824,31 @@ def _build_training_model(
         tail_momentum=config.tfc_tail_momentum,
         class_balance_beta=config.tfc_class_balance_beta,
     )
-    return Siglip2ReIDTrainingModel(retrieval, classifier, tfc_bank)
+    return Siglip2ReIDTrainingModel(
+        retrieval,
+        classifier,
+        tfc_bank,
+        clothes_classifier=_build_clothes_classifier(config, data, spec.feature_dim),
+    )
+
+
+def _build_clothes_classifier(
+    config: Siglip2ReIDJobConfig,
+    data: DatasetBundle,
+    feature_dim: int,
+) -> ClothesClassifier | None:
+    if config.clothes_adversarial_weight <= 0.0:
+        return None
+    unknown = sorted(set(data.camera_raw_ids) - set(PRCC_CLOTHES_GROUPS))
+    if unknown or len(data.camera_raw_ids) != data.num_cameras:
+        raise ValueError(
+            f"clothes adversarial training requires PRCC cameras, got {unknown}"
+        )
+    table = build_clothes_table(
+        data.identity_camera_counts,
+        [PRCC_CLOTHES_GROUPS[camera] for camera in data.camera_raw_ids],
+    )
+    return ClothesClassifier(feature_dim, table)
 
 
 def _load_siglip2_checkpoint_if_requested(
@@ -1698,6 +1954,7 @@ def _train_loader(
         dataset.person_ids,
         batch_size=config.batch_size,
         instances_per_identity=config.num_instances,
+        camera_labels=dataset.camera_ids if config.camera_balanced_sampling else None,
     )
     return DataLoader(
         dataset,
@@ -1749,6 +2006,8 @@ def _train_one_epoch(runtime: StageTrainingRuntime):
             runtime.beta_schedule.apply(runtime.model, epoch)
         if runtime.lr_scheduler is not None:
             runtime.lr_scheduler.apply(runtime.optimizer, epoch)
+        if runtime.clothes_schedule is not None:
+            runtime.clothes_schedule.apply(runtime.model.clothes_classifier, epoch)
         if runtime.anchor_provider is not None:
             runtime.anchor_provider.start_epoch()
         if runtime.stage == STAGE2 and runtime.freeze_config is not None:
@@ -1757,6 +2016,10 @@ def _train_one_epoch(runtime: StageTrainingRuntime):
             _ensure_camera_text_cache(
                 runtime.model, runtime.freeze_config, runtime.precision
             )
+        if runtime.model_ema is not None and not runtime.model_ema.initialized:
+            # Bound after Stage-2 freezing, so it tracks exactly the Stage-2
+            # trainable retrieval weights.
+            runtime.model_ema.initialize()
         runtime.model.train()
         if runtime.precision is None:
             raise ValueError("training requires a precision controller")
@@ -1788,7 +2051,7 @@ def _train_one_epoch(runtime: StageTrainingRuntime):
                     micro_batch_count += 1
                 runtime.precision.clip_grad_norm(
                     runtime.optimizer,
-                    runtime.model.parameters(),
+                    _clipped_parameters(runtime.model),
                     runtime.grad_clip_norm,
                 )
                 update_succeeded = runtime.precision.step(runtime.optimizer)
@@ -1802,6 +2065,8 @@ def _train_one_epoch(runtime: StageTrainingRuntime):
                 else:
                     runtime.model.tfc_bank.rollback_update_window()
             if update_succeeded:
+                if runtime.model_ema is not None:
+                    runtime.model_ema.update()
                 reported = {
                     name: window_totals[name] / window_size for name in metric_names
                 }
@@ -1815,6 +2080,18 @@ def _train_one_epoch(runtime: StageTrainingRuntime):
         )
 
     return train
+
+
+def _clipped_parameters(model: torch.nn.Module) -> list[torch.nn.Parameter]:
+    # The clothes discriminator trains on detached features; keeping it out of
+    # the global norm stops its gradients from rescaling the backbone update.
+    clothes_classifier = getattr(model, "clothes_classifier", None)
+    excluded = (
+        set()
+        if clothes_classifier is None
+        else {id(p) for p in clothes_classifier.parameters()}
+    )
+    return [p for p in model.parameters() if id(p) not in excluded]
 
 
 def _train_batches(runtime: StageTrainingRuntime):
@@ -1853,10 +2130,32 @@ def _validate(runtime: ValidationRuntime):
         if runtime.beta_schedule is not None:
             runtime.beta_schedule.apply(runtime.model, epoch)
         runtime.model.eval()
-        query = _validation_features(runtime, runtime.loaders.query)
-        gallery = _validation_features(runtime, runtime.loaders.gallery)
-        metrics = _score_feature_sets(runtime, query, gallery, evaluate_reid)
         extras: dict[str, float] = {}
+        if runtime.model_ema is not None:
+            # Live-weight score of the same epoch, so one run shows whether
+            # the EMA helps; the EMA score stays the selection metric.
+            raw = _score_feature_sets(
+                runtime,
+                _validation_features(runtime, runtime.loaders.query),
+                _validation_features(runtime, runtime.loaders.gallery),
+                evaluate_reid,
+            )
+            extras["raw_mAP"] = raw.map
+            extras["raw_rank_1"] = raw.cmc[1]
+        with _model_ema_scope(runtime.model_ema):
+            query = _validation_features(runtime, runtime.loaders.query)
+            gallery = _validation_features(runtime, runtime.loaders.gallery)
+            config = runtime.model_config
+            # Secondary queries never drive model selection, so they are scored
+            # only at the final epoch instead of on every validation pass.
+            final_epoch = config.stage2_first_epoch + config.stage2_epochs - 1
+            extra_queries = tuple(
+                (name, _validation_features(runtime, loader))
+                for name, loader in (
+                    runtime.loaders.extra_queries if epoch >= final_epoch else ()
+                )
+            )
+        metrics = _score_feature_sets(runtime, query, gallery, evaluate_reid)
         if query.image_only is not None and gallery.image_only is not None:
             # Fused-vs-image-only ablation from the same forward pass; the
             # primary mAP stays the configured retrieval_mode.
@@ -1865,15 +2164,8 @@ def _validate(runtime: ValidationRuntime):
             )
             extras["image_only_mAP"] = image_only.map
             extras["image_only_rank_1"] = image_only.cmc[1]
-        config = runtime.model_config
-        # Secondary queries never drive model selection, so they are scored
-        # only at the final epoch instead of on every validation pass.
-        final_epoch = config.stage2_first_epoch + config.stage2_epochs - 1
-        extra_queries = runtime.loaders.extra_queries if epoch >= final_epoch else ()
-        for name, loader in extra_queries:
-            extra = _score_feature_sets(
-                runtime, _validation_features(runtime, loader), gallery, evaluate_reid
-            )
+        for name, features in extra_queries:
+            extra = _score_feature_sets(runtime, features, gallery, evaluate_reid)
             extras[f"{name}_mAP"] = extra.map
             extras[f"{name}_rank_1"] = extra.cmc[1]
         if runtime.report_rerank:
@@ -1885,6 +2177,10 @@ def _validate(runtime: ValidationRuntime):
         return ReIDMetrics(map=metrics.map, cmc=metrics.cmc, extras=extras)
 
     return validate
+
+
+def _model_ema_scope(model_ema: ModelEma | None) -> AbstractContextManager[None]:
+    return nullcontext() if model_ema is None else model_ema.applied()
 
 
 def _validation_features(runtime: ValidationRuntime, loader: DataLoader) -> FeatureSet:
@@ -2045,6 +2341,7 @@ def _stage2_step(
         tfc_bank=runtime.model.tfc_bank,
         anchors=runtime.anchor_provider.anchors(),
         config=runtime.loss_config,
+        clothes_classifier=getattr(runtime.model, "clothes_classifier", None),
     )
     return stage2_loss_breakdown(runtime.model.retrieval_model, batch, inputs)
 
@@ -2105,6 +2402,11 @@ def _stage2_metric_values(breakdown: Stage2LossBreakdown) -> dict[str, float]:
         "tfc_cross_camera_coverage": _tensor_metric_value(
             breakdown.tfc_cross_camera_coverage
         ),
+        "clothes_loss": _tensor_metric_value(breakdown.clothes),
+        "clothes_adversarial_loss": _tensor_metric_value(
+            breakdown.clothes_adversarial
+        ),
+        "clothes_accuracy": _tensor_metric_value(breakdown.clothes_accuracy),
     }
 
 

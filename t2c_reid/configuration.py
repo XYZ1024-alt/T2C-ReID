@@ -61,6 +61,9 @@ class TrainingConfig:
     image_height: int
     image_width: int
     num_instances: int
+    camera_balanced_sampling: bool
+    color_jitter: list[float]
+    grayscale_prob: float
     num_workers: int
     data_backend: str
     prefetch_factor: int
@@ -71,6 +74,11 @@ class TrainingConfig:
     evaluation_chunk_size: int
     lr: float
     image_encoder_lr: float
+    image_encoder_frozen_layers: int
+    image_encoder_layer_decay: float
+    model_ema_decay: float
+    clothes_adversarial_weight: float
+    clothes_adversarial_start_epoch: int
     sie_coe: float
     device: str
     beta: float

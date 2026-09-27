@@ -11,6 +11,7 @@ from transformers import SiglipConfig, SiglipModel
 
 from t2c_reid.configuration import TrainingConfig, compose_training_config
 from t2c_reid.datasets import ReIDImageBatch, collate_reid_batches
+from t2c_reid.ema import ModelEma
 from t2c_reid.jobs.siglip2_reid import (
     BetaSchedule,
     JobDataConfig,
@@ -1064,6 +1065,38 @@ class Siglip2ReIDJobTest(unittest.TestCase):
 
         self.assertEqual(config.num_instances, 4)
 
+    def test_job_config_reads_clothes_robust_sampling_and_augmentation(self):
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_training_config
+
+        defaults = _job_config_from_training_config(compose_training_config())
+        args = _training_config(Path("."))
+        args.camera_balanced_sampling = True
+        args.color_jitter = [0.4, 0.4, 0.4, 0.1]
+        args.grayscale_prob = 0.2
+
+        config = _job_config_from_training_config(args)
+
+        self.assertFalse(defaults.camera_balanced_sampling)
+        self.assertEqual(defaults.color_jitter, (0.2, 0.2, 0.2, 0.05))
+        self.assertEqual(defaults.grayscale_prob, 0.0)
+        self.assertTrue(config.camera_balanced_sampling)
+        self.assertEqual(config.color_jitter, (0.4, 0.4, 0.4, 0.1))
+        self.assertEqual(config.grayscale_prob, 0.2)
+
+    def test_job_config_rejects_invalid_color_augmentation(self):
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_training_config
+
+        for field, value, message in (
+            ("grayscale_prob", 1.5, "grayscale_prob"),
+            ("color_jitter", [0.2, 0.2, 0.2], "four values"),
+            ("color_jitter", [0.2, 0.2, 0.2, 0.6], "hue"),
+        ):
+            with self.subTest(field=field, value=value):
+                args = _training_config(Path("."))
+                setattr(args, field, value)
+                with self.assertRaisesRegex(ValueError, message):
+                    _job_config_from_training_config(args)
+
     def test_job_config_reads_id_logit_scale(self):
         from t2c_reid.jobs.siglip2_reid import _job_config_from_training_config
 
@@ -1313,6 +1346,227 @@ class Siglip2ReIDJobTest(unittest.TestCase):
             _apply_freezing(model, config, "stage2")
             self.assertTrue(sie.weight.requires_grad)
 
+    def test_frozen_layers_freeze_embeddings_and_lower_blocks_when_trainable(self):
+        from dataclasses import replace
+
+        from t2c_reid.jobs.siglip2_reid import (
+            _apply_freezing,
+            _job_config_from_training_config,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_config(root)
+            job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
+        model = job.model
+        vision = _attach_vision_layers(model, count=2)
+        config = replace(
+            _job_config_from_training_config(args), image_encoder_frozen_layers=1
+        )
+
+        _apply_freezing(model, config, "stage2")
+
+        self.assertFalse(
+            any(p.requires_grad for p in vision.embeddings.parameters())
+        )
+        self.assertFalse(
+            any(p.requires_grad for p in vision.encoder.layers[0].parameters())
+        )
+        self.assertTrue(
+            all(p.requires_grad for p in vision.encoder.layers[1].parameters())
+        )
+
+        with self.assertRaisesRegex(ValueError, "exceeds the 2 vision"):
+            _apply_freezing(
+                model, replace(config, image_encoder_frozen_layers=3), "stage2"
+            )
+
+    def test_layer_decay_gives_each_vision_layer_a_decayed_lr_group(self):
+        from dataclasses import replace
+
+        from t2c_reid.jobs.siglip2_reid import (
+            _apply_freezing,
+            _build_optimizer,
+            _job_config_from_training_config,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_config(root)
+            job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
+        model = job.model
+        _attach_vision_layers(model, count=2)
+        base = _job_config_from_training_config(args)
+        config = replace(base, image_encoder_layer_decay=0.5)
+        _apply_freezing(model, config, "stage2")
+
+        optimizer = _build_optimizer(model, config)
+
+        lrs = {group["name"]: group["lr"] for group in optimizer.param_groups}
+        lr = base.image_encoder_lr
+        # L = 2 blocks; the fake has no parameterized head (layer id 3).
+        self.assertAlmostEqual(lrs["backbone_layer2"], lr * 0.5)
+        self.assertAlmostEqual(lrs["backbone_layer1"], lr * 0.25)
+        self.assertAlmostEqual(lrs["backbone_layer0"], lr * 0.125)
+        self.assertAlmostEqual(lrs["new"], base.lr)
+        names = [group["name"] for group in optimizer.param_groups]
+        self.assertEqual(names[0], "backbone_layer2")
+        self.assertLess(names.index("backbone_layer1"), names.index("backbone_layer0"))
+        self.assertTrue(names[-1].startswith("new"))
+        grouped = {
+            id(p) for group in optimizer.param_groups for p in group["params"]
+        }
+        trainable = {id(p) for p in model.parameters() if p.requires_grad}
+        self.assertEqual(grouped, trainable)
+
+    def test_job_config_rejects_invalid_freezing_decay_and_ema(self):
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_training_config
+
+        defaults = _job_config_from_training_config(compose_training_config())
+        self.assertEqual(defaults.image_encoder_frozen_layers, 0)
+        self.assertEqual(defaults.image_encoder_layer_decay, 1.0)
+        self.assertEqual(defaults.model_ema_decay, 0.0)
+        for field, value, message in (
+            ("image_encoder_frozen_layers", -1, "non-negative"),
+            ("image_encoder_layer_decay", 0.0, "0 < decay <= 1"),
+            ("image_encoder_layer_decay", 1.5, "0 < decay <= 1"),
+            ("model_ema_decay", 1.0, "0 <= decay < 1"),
+            ("model_ema_decay", -0.1, "0 <= decay < 1"),
+        ):
+            with self.subTest(field=field, value=value):
+                args = _training_config(Path("."))
+                setattr(args, field, value)
+                with self.assertRaisesRegex(ValueError, message):
+                    _job_config_from_training_config(args)
+
+    def test_model_ema_validates_with_averaged_weights_and_checkpoints_shadow(self):
+        from t2c_reid.jobs.siglip2_reid import MODEL_EMA_STATE_KEY
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_config(root)
+            args.model_ema_decay = 0.5
+            job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
+            ema = job.auxiliary_state.model_ema
+            self.assertFalse(ema.initialized)
+
+            job.train_one_epoch(1, TrainBatchReporterRecorder())
+            live = {
+                name: tensor.detach().clone()
+                for name, tensor in job.model.retrieval_model.state_dict().items()
+            }
+            metrics = job.validate(1)
+
+        self.assertTrue(ema.initialized)
+        self.assertEqual(ema.num_updates, 1)
+        self.assertIn("raw_mAP", metrics.extras)
+        self.assertIn("raw_rank_1", metrics.extras)
+        for name, tensor in job.model.retrieval_model.state_dict().items():
+            torch.testing.assert_close(tensor, live[name], msg=name)
+        trainable = {
+            name
+            for name, p in job.model.retrieval_model.named_parameters()
+            if p.requires_grad
+        }
+        self.assertTrue(trainable <= set(ema.tracked_names))
+        state = job.auxiliary_state.state_dict()
+        self.assertIn("precision", state)
+        self.assertEqual(state[MODEL_EMA_STATE_KEY]["decay"], 0.5)
+        self.assertEqual(job.checkpoint_metadata["model_ema_decay"], 0.5)
+
+    def test_model_ema_state_must_match_on_resume(self):
+        from t2c_reid.jobs.siglip2_reid import Stage2AuxiliaryState
+        from t2c_reid.precision import PrecisionController, resolve_precision
+
+        precision = PrecisionController(resolve_precision("fp32", torch.device("cpu")))
+        with_ema = Stage2AuxiliaryState(
+            precision, ModelEma(torch.nn.Linear(1, 1), 0.5)
+        )
+        without_ema = Stage2AuxiliaryState(precision)
+
+        with self.assertRaisesRegex(ValueError, "model_ema_decay"):
+            with_ema.load_state_dict(without_ema.state_dict())
+        with self.assertRaisesRegex(ValueError, "model_ema_decay"):
+            without_ema.load_state_dict(with_ema.state_dict())
+
+    def test_prcc_clothes_adversarial_trains_discriminator_and_backbone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_prcc_fixture(Path(tmp))
+            args = _training_config(root)
+            args.dataset = "prcc"
+            args.clothes_adversarial_weight = 0.5
+            args.clothes_adversarial_start_epoch = 1
+            job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
+            clothes = job.model.clothes_classifier
+            before = clothes.weight.detach().clone()
+
+            metrics = job.train_one_epoch(1, TrainBatchReporterRecorder())
+
+        # 3 identities x {A+B, C} outfits.
+        self.assertEqual(clothes.num_clothes, 6)
+        self.assertEqual(clothes.adversarial_weight, 0.5)
+        self.assertFalse(torch.equal(clothes.weight.detach(), before))
+        self.assertGreater(metrics["clothes_loss"], 0.0)
+        self.assertGreater(metrics["clothes_adversarial_loss"], 0.0)
+        self.assertIn("clothes_accuracy", metrics)
+        self.assertIn("clothes_classifier.weight", job.model.state_dict())
+        grouped = {
+            id(p) for group in job.optimizer.param_groups for p in group["params"]
+        }
+        self.assertIn(id(clothes.weight), grouped)
+        self.assertEqual(job.checkpoint_metadata["clothes_adversarial_weight"], 0.5)
+        self.assertEqual(job.checkpoint_metadata["clothes_adversarial_start_epoch"], 1)
+
+    def test_clothes_adversarial_term_waits_for_start_epoch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_prcc_fixture(Path(tmp))
+            args = _training_config(root)
+            args.dataset = "prcc"
+            args.clothes_adversarial_weight = 0.5
+            job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
+
+            job.train_one_epoch(1, TrainBatchReporterRecorder())
+
+        self.assertEqual(job.model.clothes_classifier.adversarial_weight, 0.0)
+
+    def test_job_config_rejects_invalid_clothes_adversarial_settings(self):
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_training_config
+
+        defaults = _job_config_from_training_config(compose_training_config())
+        self.assertEqual(defaults.clothes_adversarial_weight, 0.0)
+        self.assertEqual(defaults.clothes_adversarial_start_epoch, 2)
+        for field, value, dataset, message in (
+            ("clothes_adversarial_weight", -1.0, "prcc", "non-negative"),
+            ("clothes_adversarial_weight", float("nan"), "prcc", "finite"),
+            ("clothes_adversarial_start_epoch", 0, "prcc", "positive"),
+            ("clothes_adversarial_weight", 1.0, "market1501", "dataset=prcc"),
+        ):
+            with self.subTest(field=field, value=value, dataset=dataset):
+                args = _training_config(Path("."))
+                args.dataset = dataset
+                setattr(args, field, value)
+                with self.assertRaisesRegex(ValueError, message):
+                    _job_config_from_training_config(args)
+
+    def test_default_checkpoint_metadata_omits_freezing_decay_and_ema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            job = build_training_job(
+                _training_config(root), siglip2_loader=_load_fake_siglip2
+            )
+
+        for key in (
+            "image_encoder_frozen_layers",
+            "image_encoder_layer_decay",
+            "model_ema_decay",
+            "clothes_adversarial_weight",
+            "clothes_adversarial_start_epoch",
+        ):
+            self.assertNotIn(key, job.checkpoint_metadata)
+        self.assertIsNone(job.model.clothes_classifier)
+        self.assertIsNone(job.auxiliary_state.model_ema)
+        self.assertNotIn("model_ema", job.auxiliary_state.state_dict())
+
     def test_job_config_stage1_feature_cache_defaults_true(self):
         from t2c_reid.jobs.siglip2_reid import _job_config_from_training_config
 
@@ -1505,7 +1759,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         # never load images through it (extraction uses the eval transform and
         # later steps read the cache), so the epoch completes without raising.
         class PoisonTrainTransform:
-            def __init__(self, image_processor, image_size=None):
+            def __init__(self, image_processor, image_size=None, **augmentation):
                 self.image_processor = image_processor
                 self.image_size = image_size
 
@@ -1539,7 +1793,9 @@ class Siglip2ReIDJobTest(unittest.TestCase):
             args.stage1_feature_cache = feature_cache
             with mock.patch(
                 "t2c_reid.jobs.siglip2_reid.Siglip2TrainImageTransform",
-                Siglip2ImageTransform,
+                lambda processor, *, image_size, **augmentation: Siglip2ImageTransform(
+                    processor, image_size
+                ),
             ):
                 job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
             losses = []
@@ -1645,6 +1901,16 @@ def _stage_metadata_for(training_config: TrainingConfig):
         identity_camera_counts=torch.ones(2, 2, dtype=torch.long),
     )
     return _stage_metadata(config, spec, data)
+
+
+def _attach_vision_layers(model: torch.nn.Module, count: int) -> torch.nn.Module:
+    """Give the fake vision encoder real ``layers`` for freezing/LLRD tests."""
+
+    vision = model.retrieval_model.image_encoder.siglip2_model.vision_model
+    vision.encoder.layers = torch.nn.ModuleList(
+        torch.nn.Linear(4, 4) for _ in range(count)
+    )
+    return vision
 
 
 def _trainable_parameter_count(module: torch.nn.Module) -> int:

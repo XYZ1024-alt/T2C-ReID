@@ -200,8 +200,47 @@ class ReIDImageDatasetTest(unittest.TestCase):
                 0.5,
                 [0.02, 0.2],
                 [0.3, float("inf")],
+                0.0,
                 1,
             )
+        with self.assertRaisesRegex(ValueError, "grayscale_prob"):
+            ImageTransformConfig(
+                image_size=(4, 2),
+                mean=(0.5, 0.5, 0.5),
+                std=(0.5, 0.5, 0.5),
+                grayscale_prob=1.5,
+            )
+
+    def test_native_and_python_grayscale_replicate_one_channel(self):
+        class Processor:
+            image_mean = (0.5, 0.5, 0.5)
+            image_std = (0.5, 0.5, 0.5)
+
+        from t2c_reid.transforms import Siglip2TrainImageTransform
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "color.png"
+            Image.new("RGB", (4, 8), color=(200, 30, 90)).save(path)
+            transform = Siglip2TrainImageTransform(
+                Processor(),
+                image_size=(8, 4),
+                flip_prob=0.0,
+                color_jitter=(0.0, 0.0, 0.0, 0.0),
+                crop_padding=0,
+                erase_prob=0.0,
+                grayscale_prob=1.0,
+            )
+            python_image = transform(Image.open(path).convert("RGB"))
+            native_image = RustReIDBatchCollator(transform.native_config)(
+                [ReIDImageRecord(str(path), 0, 0, 0, 0)]
+            ).images[0]
+
+        for image in (python_image, native_image):
+            self.assertTrue(torch.equal(image[0], image[1]))
+            self.assertTrue(torch.equal(image[1], image[2]))
+        self.assertLessEqual(
+            float((native_image - python_image).abs().max()), 2.0 / 255.0 + 1e-6
+        )
 
     def test_native_pipeline_decodes_grayscale_and_rgba_png(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -281,6 +320,43 @@ class ReIDImageDatasetTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "insufficient identity counts:.*2: 1"):
             IdentityBalancedBatchSampler(
                 [0, 0, 1, 1, 2], batch_size=4, instances_per_identity=2
+            )
+
+
+    def test_camera_balanced_sampler_covers_every_camera_of_an_identity(self):
+        labels = [0] * 9 + [1] * 6
+        cameras = [1] * 7 + [2, 3] + [1, 1, 1, 3, 3, 3]
+        sampler = IdentityBalancedBatchSampler(
+            labels, batch_size=6, instances_per_identity=3, camera_labels=cameras
+        )
+
+        for _ in range(50):
+            batch = next(iter(sampler))
+            by_identity: dict[int, list[int]] = {}
+            for index in batch:
+                by_identity.setdefault(labels[index], []).append(cameras[index])
+            self.assertEqual(len(batch), len(set(batch)))
+            self.assertEqual(sorted(by_identity[0]), [1, 2, 3])
+            self.assertEqual(sorted(set(by_identity[1])), [1, 3])
+
+    def test_camera_balanced_sampler_refills_from_cameras_with_images_left(self):
+        labels = [0] * 5 + [1] * 4
+        cameras = [1, 1, 1, 1, 2] + [1, 2, 1, 2]
+        sampler = IdentityBalancedBatchSampler(
+            labels, batch_size=8, instances_per_identity=4, camera_labels=cameras
+        )
+
+        batch = next(iter(sampler))
+
+        self.assertEqual(len(batch), len(set(batch)))
+        self.assertEqual(Counter(labels[index] for index in batch), {0: 4, 1: 4})
+        identity0_cameras = sorted(cameras[index] for index in batch if labels[index] == 0)
+        self.assertEqual(identity0_cameras, [1, 1, 1, 2])
+
+    def test_camera_balanced_sampler_rejects_misaligned_camera_labels(self):
+        with self.assertRaisesRegex(ValueError, "camera_labels"):
+            IdentityBalancedBatchSampler(
+                [0, 0, 1, 1], batch_size=4, instances_per_identity=2, camera_labels=[1]
             )
 
 

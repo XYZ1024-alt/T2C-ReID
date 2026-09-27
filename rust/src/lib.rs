@@ -4,7 +4,7 @@ mod rerank;
 
 use pyo3::prelude::*;
 
-const NATIVE_ABI_VERSION: u32 = 1;
+const NATIVE_ABI_VERSION: u32 = 2;
 
 #[pyfunction]
 fn native_version() -> (&'static str, u32) {

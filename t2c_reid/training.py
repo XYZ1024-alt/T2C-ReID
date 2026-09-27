@@ -4,6 +4,11 @@ Stage-1 aligns image features with identity-aware prompt features. Stage-2
 combines ReID, all-identity SigLIP alignment, and camera-aware cross-modal TFC::
 
     L_total = L_id + L_triplet + alignment_weight * L_alignment + tfc_weight * L_TFC
+              [+ L_clothes + clothes_adversarial_weight * L_CAL]
+
+The bracketed clothes terms exist only when a clothes classifier is supplied;
+``L_clothes`` trains the classifier on detached features and never reaches the
+backbone.
 """
 
 from __future__ import annotations
@@ -13,6 +18,7 @@ from dataclasses import dataclass, field
 import torch
 from torch.nn import functional as F
 
+from t2c_reid.clothes import ClothesClassifier
 from t2c_reid.features import l2_normalize
 from t2c_reid.losses import (
     batch_hard_triplet,
@@ -92,6 +98,7 @@ class Stage2LossInputs:
     tfc_bank: CameraAwareTFCBank
     anchors: torch.Tensor
     config: Stage2LossConfig = field(default_factory=Stage2LossConfig)
+    clothes_classifier: ClothesClassifier | None = None
 
 
 @dataclass(frozen=True)
@@ -118,6 +125,10 @@ class Stage2LossBreakdown:
     tfc_cross_camera_coverage: torch.Tensor
     tfc_weight: float
     alignment_weight: float
+    clothes: torch.Tensor
+    clothes_adversarial: torch.Tensor
+    clothes_accuracy: torch.Tensor
+    clothes_adversarial_weight: float = 0.0
 
     @property
     def total(self) -> torch.Tensor:
@@ -126,6 +137,8 @@ class Stage2LossBreakdown:
             + self.triplet
             + self.alignment_weight * self.alignment
             + self.tfc_weight * self.tfc
+            + self.clothes
+            + self.clothes_adversarial_weight * self.clothes_adversarial
         )
 
 
@@ -191,6 +204,7 @@ def stage2_loss_breakdown(
         inputs.config.triplet_margin,
         metric=inputs.config.triplet_metric,
     )
+    clothes = _clothes_terms(inputs.clothes_classifier, outputs["bn"], batch)
 
     if inputs.config.tfc_weight == 0.0:
         zero = outputs["retrieval"].float().sum() * 0.0
@@ -208,6 +222,7 @@ def stage2_loss_breakdown(
             tfc_cross_camera_coverage=zero.detach(),
             tfc_weight=inputs.config.tfc_weight,
             alignment_weight=inputs.config.alignment_weight,
+            **clothes,
         )
 
     visual = l2_normalize(outputs["bn"])
@@ -235,7 +250,29 @@ def stage2_loss_breakdown(
         tfc_cross_camera_coverage=tfc.cross_camera_coverage,
         tfc_weight=inputs.config.tfc_weight,
         alignment_weight=inputs.config.alignment_weight,
+        **clothes,
     )
+
+
+def _clothes_terms(
+    classifier: ClothesClassifier | None,
+    features: torch.Tensor,
+    batch: TrainingBatch,
+) -> dict[str, torch.Tensor | float]:
+    if classifier is None:
+        zero = features.float().sum() * 0.0
+        return {
+            "clothes": zero,
+            "clothes_adversarial": zero,
+            "clothes_accuracy": zero.detach(),
+        }
+    terms = classifier.loss(features, batch.person_ids, batch.camera_ids)
+    return {
+        "clothes": terms.classifier,
+        "clothes_adversarial": terms.adversarial,
+        "clothes_accuracy": terms.accuracy,
+        "clothes_adversarial_weight": classifier.adversarial_weight,
+    }
 
 
 def _encode_tfc_text_teacher(

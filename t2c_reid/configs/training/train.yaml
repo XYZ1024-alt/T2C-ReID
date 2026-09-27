@@ -24,6 +24,12 @@ precision: auto
 image_height: 392
 image_width: 196
 num_instances: 4
+# Draw each identity's num_instances images round-robin over its cameras
+# (PRCC: A/B same clothes, C changed clothes) instead of uniformly.
+camera_balanced_sampling: false
+# Training-only color augmentation: brightness, contrast, saturation, hue.
+color_jitter: [0.2, 0.2, 0.2, 0.05]
+grayscale_prob: 0.0
 num_workers: 8
 data_backend: rust
 prefetch_factor: 2
@@ -34,6 +40,19 @@ evaluation_backend: rust
 evaluation_chunk_size: 256
 lr: 0.0001
 image_encoder_lr: 0.000005
+# Freeze the vision embeddings plus the first N encoder blocks whenever the
+# image encoder trains (So400m has 27 blocks); 0 trains the whole tower.
+image_encoder_frozen_layers: 0
+# Layer-wise LR decay: block i of L gets image_encoder_lr * decay^(L + 1 - i);
+# 1.0 gives every vision parameter image_encoder_lr.
+image_encoder_layer_decay: 1.0
+# Stage-2 weight EMA used for validation; 0 disables it.
+model_ema_decay: 0.0
+# PRCC clothes-adversarial loss (CAL) weight; 0 disables it. The clothes
+# discriminator trains from the first Stage-2 epoch, the adversarial term from
+# Stage-2 epoch clothes_adversarial_start_epoch.
+clothes_adversarial_weight: 0.0
+clothes_adversarial_start_epoch: 2
 sie_coe: 0.0
 device: cuda
 beta: 0.1
