@@ -181,8 +181,24 @@ model_ema_decay=0.997`。EMA 不影响训练本身，`raw_mAP` 可以直接和 �
 | `prcc-cos-lr2e6-e20-lld09-ema997-s0` | `image_encoder_layer_decay=0.9` | 底层学得慢、顶层照常，看能否推迟学透 |
 | `prcc-cos-lr2e6-e20-cal1-ema997-s0` | `clothes_adversarial_weight=1.0`（对抗项从 Stage-2 第 2 个 epoch 起） | 直接压制特征里的衣服信息，针对换衣主指标 |
 
+LLRD 中间结果（对照为 §3 的 `prcc-cos-lr2e6-e20-s0` raw）：
+
+| Stage-2 epoch | EMA mAP | raw_mAP | `triplet_active_fraction` | 对照 raw | 对照 `triplet_active_fraction` |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 0.4509 | 0.5335 | 1.0000 | 0.6689 | 1.0000 |
+| 2 | 0.5708 | 0.6967 | 0.9999 | 0.8077 | – |
+| 3 | 0.6948 | 0.7984 | 0.9848 | 0.8552 | 0.8338 |
+| 4 | 0.7814 | 0.8553 | 0.8178 | **0.8847** | 0.4341 |
+| 5 | 0.8311 | **0.8866** | 0.5447 | 0.8778 | 0.1856 |
+
 CAL 实现见 `t2c_reid/clothes.py` 与 `DESIGN.md` §6.2.1：衣服标签为 `(pid, A/B 或 C)`，
 余弦判别器 scale 16，ε = 0.1，与 Simple-CCReID 官方实现一致（有单元测试逐项对照）。
+
+CAL 第一次启动作废：判别器权重和其他新增参数共用 `new` 组，受 Stage-2 warmup 缩放，第 1 个
+epoch 的学习率只有 `1e-4 × 0.2 = 2e-5`（官方为常数 3.5e-4）。119 步后 `clothes_loss` 仍约 5.50
+（随机水平），`clothes_accuracy` 为 0，第 2 个 epoch 起的对抗项等于在对抗一个随机判别器。
+已停掉，改为独立的 `clothes` 参数组，学习率恒为 `clothes_classifier_lr=3.5e-4`，不受调度影响，
+然后从 Stage-1 重跑。
 
 ## 9. 产物位置
 

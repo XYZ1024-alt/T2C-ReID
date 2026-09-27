@@ -294,7 +294,9 @@ L_total  += L_clothes + clothes_adversarial_weight * L_CAL
 backbone 不会因为分开同一个人的不同衣服而得到奖励。两条梯度路径不相交：一次 backward 等价
 于官方实现的判别器/主干两个 optimizer。判别器从 Stage-2 第 1 个 epoch 起训练；对抗项从
 Stage-2 局部 epoch `clothes_adversarial_start_epoch`（默认 2）起才计入，此前权重为 0。
-判别器权重进入 `new` 参数组，不参与 `grad_clip_norm` 的全局范数；衣服标签查表由训练集
+判别器权重单独放在 `clothes` 参数组，学习率恒为 `clothes_classifier_lr`（默认 3.5e-4，
+与官方 Adam 设置一致），不受 Stage-2 warmup/cosine 调度：否则 warmup 第 1 个 epoch 只有
+`0.2 * lr = 2e-5`，对抗项开启时判别器仍停在随机水平。该组不参与 `grad_clip_norm` 的全局范数；衣服标签查表由训练集
 派生，不写入 state dict。logit 在 autocast 之外以 FP32 计算。
 
 ### 6.3 Camera-aware Cross-modal TFC
@@ -366,7 +368,8 @@ logit_scale / logit_bias: frozen
 ```
 
 两个 stage 都使用同一个 `StageLRScheduler`：线性 warmup 后 cosine 衰减，按 epoch 缩放
-每个 param group 的 base lr，保持 backbone / new 的比例。默认两阶段都是 `cosine` +
+每个 param group 的 base lr，保持 backbone / new 的比例；标记 `fixed_lr` 的组（CAL 判别器）
+保持常数。默认两阶段都是 `cosine` +
 5 epoch warmup。Stage-1 的 stage epoch 从 1 起算，Stage-2 从 `stage2_first_epoch` 起算。
 
 文本身份 anchor：
