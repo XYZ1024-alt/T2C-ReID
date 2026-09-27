@@ -53,6 +53,9 @@ model_ema_decay: 0.0
 # Stage-2 epoch clothes_adversarial_start_epoch.
 clothes_adversarial_weight: 0.0
 clothes_adversarial_start_epoch: 2
+# Constant discriminator learning rate (official CAL value), outside the
+# Stage-2 warmup/cosine schedule.
+clothes_classifier_lr: 0.00035
 sie_coe: 0.0
 device: cuda
 beta: 0.1

@@ -419,6 +419,8 @@ Optimization:
   0 disables, the reference implementation uses 1.0)
 - `clothes_adversarial_start_epoch=2` (Stage-2 epoch at which the adversarial
   term starts; the clothes discriminator trains from Stage-2 epoch 1)
+- `clothes_classifier_lr=0.00035` (constant clothes-discriminator LR, the
+  reference value; exempt from the Stage-2 warmup/cosine schedule)
 - `grad_clip_norm=5.0` (0 disables)
 - `alignment_weight=0.1`
 - `tfc_weight=1.0`
@@ -481,8 +483,10 @@ With `clothes_adversarial_weight > 0` (PRCC only), a cosine clothes classifier
 (scale 16) over `(pid, outfit)` labels, where cameras A/B share an outfit and C
 is the changed outfit, trains on detached BNNeck features. The backbone
 minimizes the CAL multi-positive loss (epsilon 0.1) against the detached
-classifier weights. Stage-2 logs `clothes_loss`, `clothes_adversarial_loss`,
-and the discriminator's `clothes_accuracy`.
+classifier weights. The classifier has its own optimizer group `clothes` at
+the constant `clothes_classifier_lr`; under the shared Stage-2 warmup it would
+stay at chance while the adversarial term starts. Stage-2 logs `clothes_loss`,
+`clothes_adversarial_loss`, and the discriminator's `clothes_accuracy`.
 
 With `model_ema_decay > 0`, the EMA starts from the weights at the first Stage-2
 epoch, is updated after every successful optimizer step, and replaces the live

@@ -1028,6 +1028,26 @@ class Siglip2ReIDJobTest(unittest.TestCase):
 
         self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 0.5e-4)
 
+    def test_stage_lr_scheduler_leaves_fixed_lr_groups_constant(self):
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": [torch.nn.Parameter(torch.zeros(1))], "lr": 1e-4},
+                {
+                    "params": [torch.nn.Parameter(torch.zeros(1))],
+                    "lr": 3.5e-4,
+                    "fixed_lr": True,
+                },
+            ]
+        )
+        scheduler = StageLRScheduler(
+            base_lrs=(1e-4, 3.5e-4), total_epochs=10, warmup_epochs=5
+        )
+
+        scheduler.apply(optimizer, epoch=1)
+
+        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 0.2e-4)
+        self.assertAlmostEqual(optimizer.param_groups[1]["lr"], 3.5e-4)
+
     def test_stage2_cosine_scheduler_changes_lr_across_epochs(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
@@ -1517,6 +1537,36 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         self.assertEqual(job.checkpoint_metadata["clothes_adversarial_weight"], 0.5)
         self.assertEqual(job.checkpoint_metadata["clothes_adversarial_start_epoch"], 1)
 
+    def test_clothes_discriminator_lr_is_constant_outside_stage2_warmup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_prcc_fixture(Path(tmp))
+            args = _training_config(root)
+            args.dataset = "prcc"
+            args.clothes_adversarial_weight = 0.5
+            args.clothes_classifier_lr = 2e-3
+            args.stage2_lr_scheduler = "cosine"
+            args.stage2_warmup_epochs = 5
+            args.epochs = 10
+            job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
+
+            metrics = job.train_one_epoch(1, TrainBatchReporterRecorder())
+
+        weight = job.model.clothes_classifier.weight
+        clothes_groups = [
+            group
+            for group in job.optimizer.param_groups
+            if any(p is weight for p in group["params"])
+        ]
+        self.assertEqual(len(clothes_groups), 1)
+        (clothes_group,) = clothes_groups
+        self.assertEqual(clothes_group["name"], "clothes")
+        self.assertEqual(len(clothes_group["params"]), 1)
+        self.assertTrue(clothes_group["fixed_lr"])
+        self.assertAlmostEqual(clothes_group["lr"], 2e-3)
+        self.assertIs(job.optimizer.param_groups[-1], clothes_group)
+        # The shared groups are still in the first warmup epoch (0.2x).
+        self.assertAlmostEqual(metrics["lr"], 0.2 * args.image_encoder_lr)
+
     def test_clothes_adversarial_term_waits_for_start_epoch(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_prcc_fixture(Path(tmp))
@@ -1535,10 +1585,13 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         defaults = _job_config_from_training_config(compose_training_config())
         self.assertEqual(defaults.clothes_adversarial_weight, 0.0)
         self.assertEqual(defaults.clothes_adversarial_start_epoch, 2)
+        self.assertAlmostEqual(defaults.clothes_classifier_lr, 3.5e-4)
         for field, value, dataset, message in (
             ("clothes_adversarial_weight", -1.0, "prcc", "non-negative"),
             ("clothes_adversarial_weight", float("nan"), "prcc", "finite"),
             ("clothes_adversarial_start_epoch", 0, "prcc", "positive"),
+            ("clothes_classifier_lr", 0.0, "prcc", "clothes_classifier_lr"),
+            ("clothes_classifier_lr", float("inf"), "prcc", "clothes_classifier_lr"),
             ("clothes_adversarial_weight", 1.0, "market1501", "dataset=prcc"),
         ):
             with self.subTest(field=field, value=value, dataset=dataset):

@@ -231,6 +231,7 @@ class Siglip2ReIDJobConfig:
     model_ema_decay: float = 0.0
     clothes_adversarial_weight: float = 0.0
     clothes_adversarial_start_epoch: int = 2
+    clothes_classifier_lr: float = 3.5e-4
 
 
 @dataclass(frozen=True)
@@ -467,7 +468,8 @@ class StageLRScheduler:
     Linear warmup from ``base_lr / warmup_epochs`` at stage epoch 1 up to the full
     ``base_lr`` at ``warmup_epochs``, then a cosine decay toward ~0 by ``total_epochs``.
     Every param group is scaled by the same factor so the grouped backbone/new
-    learning rates keep their ratio. ``warmup_epochs == 0`` disables warmup and
+    learning rates keep their ratio; groups marked ``fixed_lr`` (the CAL clothes
+    discriminator) keep their constant rate. ``warmup_epochs == 0`` disables warmup and
     applies pure cosine decay from stage epoch 1.
     """
 
@@ -490,7 +492,8 @@ class StageLRScheduler:
         stage_epoch = epoch - self.first_epoch + 1
         factor = self.scale(stage_epoch)
         for group, base_lr in zip(optimizer.param_groups, self.base_lrs):
-            group["lr"] = base_lr * factor
+            if not group.get("fixed_lr", False):
+                group["lr"] = base_lr * factor
 
 
 class Siglip2ReIDTrainingModel(torch.nn.Module):
@@ -1089,6 +1092,7 @@ def _job_config_from_training_config(config: TrainingConfig) -> Siglip2ReIDJobCo
         model_ema_decay=config.model_ema_decay,
         clothes_adversarial_weight=config.clothes_adversarial_weight,
         clothes_adversarial_start_epoch=config.clothes_adversarial_start_epoch,
+        clothes_classifier_lr=config.clothes_classifier_lr,
     )
 
 
@@ -1098,6 +1102,9 @@ def _validate_clothes_adversarial_config(config: TrainingConfig) -> None:
         raise ValueError("clothes_adversarial_weight must be finite and non-negative")
     if config.clothes_adversarial_start_epoch < 1:
         raise ValueError("clothes_adversarial_start_epoch must be positive")
+    lr = config.clothes_classifier_lr
+    if not math.isfinite(lr) or lr <= 0.0:
+        raise ValueError("clothes_classifier_lr must be finite and positive")
     if weight > 0.0 and config.dataset != "prcc":
         raise ValueError(
             "clothes_adversarial_weight > 0 requires dataset=prcc: clothes "
@@ -1352,6 +1359,11 @@ NO_DECAY_PARAMETER_PREFIXES = (
     "retrieval_model.image_encoder.sie_embedding.",
     "tfc_bank.camera_transfer_logits",
 )
+# The CAL clothes discriminator follows the official Simple-CCReID optimizer:
+# its own constant learning rate, outside the Stage-2 warmup/cosine schedule.
+# Under the shared schedule it would stay near chance through the warmup.
+CLOTHES_PARAMETER_PREFIX = "clothes_classifier."
+OPTIMIZER_FAMILY_ORDER = {"backbone": 0, "new": 1, "clothes": 2}
 
 
 def _build_optimizer(
@@ -1374,7 +1386,12 @@ def _build_optimizer(
         if not parameter.requires_grad:
             continue
         backbone = name.startswith(BACKBONE_PARAMETER_PREFIXES)
-        family = "backbone" if backbone else "new"
+        if backbone:
+            family = "backbone"
+        elif name.startswith(CLOTHES_PARAMETER_PREFIX):
+            family = "clothes"
+        else:
+            family = "new"
         layer_id = (
             _vision_layer_id(name, num_layers) if backbone and layer_decay < 1.0 else None
         )
@@ -1385,13 +1402,17 @@ def _build_optimizer(
             "no trainable parameters were found for the requested stage; "
             "enable at least one of the prompt_bank/classifier/text_encoder"
         )
-    family_lrs = {"backbone": config.image_encoder_lr, "new": config.lr}
+    family_lrs = {
+        "backbone": config.image_encoder_lr,
+        "new": config.lr,
+        "clothes": config.clothes_classifier_lr,
+    }
     # Deepest vision layer first, so param_groups[0] (the reported lr) keeps
     # the undecayed image_encoder_lr.
     ordered = sorted(
         grouped,
         key=lambda key: (
-            key[0] != "backbone",
+            OPTIMIZER_FAMILY_ORDER[key[0]],
             -(key[1] if key[1] is not None else 0),
             key[2],
         ),
@@ -1409,6 +1430,7 @@ def _build_optimizer(
                 "lr": lr,
                 "weight_decay": 0.0 if no_decay else WEIGHT_DECAY,
                 "name": f"{name}_no_decay" if no_decay else name,
+                "fixed_lr": family == "clothes",
             }
         )
     return torch.optim.AdamW(param_groups)
@@ -1573,6 +1595,7 @@ def _stage_metadata(
             "model_ema_decay": config.model_ema_decay,
             "clothes_adversarial_weight": config.clothes_adversarial_weight,
             "clothes_adversarial_start_epoch": config.clothes_adversarial_start_epoch,
+            "clothes_classifier_lr": config.clothes_classifier_lr,
             "beta": config.beta,
             "beta_warmup_epochs": config.beta_warmup_epochs,
             "alignment_weight": config.alignment_weight,

@@ -79,6 +79,7 @@ class TrainingConfig:
     model_ema_decay: float
     clothes_adversarial_weight: float
     clothes_adversarial_start_epoch: int
+    clothes_classifier_lr: float
     sie_coe: float
     device: str
     beta: float
